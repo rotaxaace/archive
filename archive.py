@@ -7,11 +7,20 @@ import time
 import html
 import os
 import re
+import hashlib
+from Crypto. Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+import base64
 
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-DB_NAME = "thoughts_archive.db"  # НОВОЕ ИМЯ БАЗЫ ДАННЫХ
+
+# Ключ шифрования (уникальный для тебя) ← ДОБАВИТЬ
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "default_secret_key_12345")
+
+# Для Railway используем /tmp (бесплатный тариф)
+DB_NAME = "/tmp/thoughts_archive.db"
 
 # Лимиты
 DAILY_TOPIC_LIMIT = 5  # Максимум 5 тем в день на пользователя
@@ -1275,6 +1284,40 @@ def send_reply_notification(user_id, topic_id, reply_id, reply_text):
         
     except Exception as e:
         logger.error(f"Ошибка в функции send_reply_notification: {e}")
+
+# ==================== ШИФРОВАННЫЕ БЭКАПЫ ====================
+def encrypt_data(data, key=ENCRYPTION_KEY):
+    """Шифруем данные AES-256"""
+    try:
+        key_hash = hashlib.sha256(key.encode()).digest()
+        cipher = AES.new(key_hash, AES.MODE_CBC)
+        ct_bytes = cipher.encrypt(pad(data, AES.block_size))
+        iv = base64.b64encode(cipher.iv).decode('utf-8')
+        ct = base64.b64encode(ct_bytes).decode('utf-8')
+        return iv + ":" + ct
+    except Exception as e:
+        logger.error(f"Ошибка шифрования: {e}")
+        return None
+
+def decrypt_data(encrypted_data, key=ENCRYPTION_KEY):
+    """Расшифровываем данные AES-256"""
+    try:
+        if not encrypted_data or ":" not in encrypted_data:
+            return None
+            
+        iv, ct = encrypted_data.split(":", 1)
+        iv = base64.b64decode(iv)
+        ct = base64.b64decode(ct)
+        key_hash = hashlib.sha256(key.encode()).digest()
+        cipher = AES.new(key_hash, AES.MODE_CBC, iv)
+        pt = unpad(cipher.decrypt(ct), AES.block_size)
+        return pt
+    except Exception as e:
+        logger.error(f"Ошибка расшифровки: {e}")
+        return None
+
+# Храним сессии восстановления
+restore_sessions = {}
 
 # ==================== БОТ ====================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
@@ -2859,6 +2902,273 @@ def menu_banned_callback(call):
     show_main_menu_for_banned_user(call.message.chat.id, call.from_user.id)
     bot.answer_callback_query(call.id)
 
+# ==================== КОМАНДЫ АДМИНА ДЛЯ БЭКАПОВ ====================
+@bot.message_handler(commands=['secure_save'])
+def secure_backup_command(message):
+    """Зашифрованное сохранение базы (только админ)"""
+    user_id = message.from_user.id
+    
+    # СТРОГАЯ ПРОВЕРКА АДМИНА
+    if user_id != ADMIN_ID:
+        logger.warning(f"🚫 Попытка доступа к secure_save от {user_id}")
+        bot.send_message(message.chat.id, "❌ Команда не найдена")
+        return
+    
+    try:
+        # Проверяем существует ли база
+        if not os.path.exists(DB_NAME):
+            bot.send_message(message.chat.id, "❌ База данных не найдена")
+            return
+        
+        # Читаем базу
+        with open(DB_NAME, 'rb') as f:
+            db_data = f.read()
+        
+        if not db_data:
+            bot.send_message(message.chat.id, "❌ База данных пуста")
+            return
+        
+        # Шифруем
+        encrypted = encrypt_data(db_data)
+        
+        if not encrypted:
+            bot.send_message(message.chat.id, "❌ Ошибка шифрования")
+            return
+        
+        # Отправляем зашифрованный текст (Telegram ограничение ~4000 символов)
+        chunk_size = 3500
+        chunks = [encrypted[i:i+chunk_size] for i in range(0, len(encrypted), chunk_size)]
+        
+        bot.send_message(message.chat.id, 
+                        f"🔐 **ЗАШИФРОВАННЫЙ БЭКАП**\n\n"
+                        f"Частей: {len(chunks)}\n"
+                        f"Размер базы: {len(db_data):,} байт\n\n"
+                        f"⚠️ **ХРАНИ В БЕЗОПАСНОМ МЕСТЕ!**")
+        
+        # Отправляем части
+        for i, chunk in enumerate(chunks, 1):
+            bot.send_message(message.chat.id, 
+                           f"🔑 **ЧАСТЬ {i}/{len(chunks)}:**\n"
+                           f"`{chunk}`", 
+                           parse_mode='Markdown')
+        
+        # Отправляем инструкцию
+        bot.send_message(message.chat.id,
+                        "📋 **КАК ВОССТАНОВИТЬ:**\n\n"
+                        "1. Сохрани ВСЕ части выше\n"
+                        "2. После обновления бота:\n"
+                        "3. /secure_restore\n"
+                        "4. Отправь количество частей (например: 3)\n"
+                        "5. Пришли ВСЕ части по очереди\n\n"
+                        "🔒 **ТОЛЬКО ТЫ МОЖЕШЬ ВОССТАНОВИТЬ!**")
+        
+        logger.info(f"🔐 Зашифрованный бэкап создан для админа {user_id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка secure_save: {e}")
+        bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
+
+@bot.message_handler(commands=['secure_restore'])
+def secure_restore_start_command(message):
+    """Начать восстановление из зашифрованного бэкапа"""
+    user_id = message.from_user.id
+    
+    if user_id != ADMIN_ID:
+        bot.send_message(message.chat.id, "❌ Команда не найдена")
+        return
+    
+    # Инициализируем сессию восстановления
+    restore_sessions[user_id] = {
+        'parts': [],
+        'expecting_parts': None,
+        'step': 'waiting_count'
+    }
+    
+    bot.send_message(message.chat.id,
+                    "🔓 **ВОССТАНОВЛЕНИЕ ИЗ ШИФРОВКИ**\n\n"
+                    "1. Сначала отправь количество частей\n"
+                    "   Пример: `3`\n\n"
+                    "2. Затем пришли ВСЕ части по очереди\n"
+                    "3. После проверки база восстановится\n\n"
+                    "📌 **Отправь число частей:**")
+
+@bot.message_handler(commands=['cancel_restore'])
+def cancel_restore_command(message):
+    """Отмена восстановления"""
+    user_id = message.from_user.id
+    if user_id in restore_sessions:
+        del restore_sessions[user_id]
+        bot.send_message(message.chat.id, "❌ Восстановление отменено")
+    else:
+        bot.send_message(message.chat.id, "❌ Нет активного восстановления")
+
+@bot.message_handler(func=lambda message: message.from_user.id in restore_sessions)
+def handle_restore_session(message):
+    """Обработка сессии восстановления"""
+    user_id = message.from_user.id
+    session = restore_sessions[user_id]
+    text = message.text.strip()
+    
+    try:
+        if session['step'] == 'waiting_count':
+            # Ждем количество частей
+            parts_count = int(text)
+            if parts_count < 1 or parts_count > 100:
+                bot.send_message(message.chat.id, "❌ Неверное количество (1-100)")
+                del restore_sessions[user_id]
+                return
+            
+            session['expecting_parts'] = parts_count
+            session['step'] = 'collecting_parts'
+            
+            bot.send_message(message.chat.id,
+                            f"✅ Ожидаю {parts_count} частей\n"
+                            f"Отправляй их по одной (только текст):")
+        
+        elif session['step'] == 'collecting_parts':
+            # Собираем части
+            session['parts'].append(text)
+            received = len(session['parts'])
+            total = session['expecting_parts']
+            
+            bot.send_message(message.chat.id, f"✅ Часть {received}/{total} принята")
+            
+            # Проверяем, все ли части собраны
+            if received >= total:
+                # Собираем полный зашифрованный текст
+                encrypted_data = "".join(session['parts'])
+                
+                # Пробуем расшифровать
+                decrypted = decrypt_data(encrypted_data)
+                
+                if decrypted is None:
+                    bot.send_message(message.chat.id, 
+                                    "❌ **ОШИБКА РАСШИФРОВКИ!**\n\n"
+                                    "⚠️ Возможные причины:\n"
+                                    "1. Неверный ключ шифрования\n"
+                                    "2. Потеряна часть данных\n"
+                                    "3. Неправильный порядок частей")
+                else:
+                    # Сохраняем базу
+                    with open(DB_NAME, 'wb') as f:
+                        f.write(decrypted)
+                    
+                    # Перезапускаем соединение с базой
+                    global db
+                    db = init_db()
+                    
+                    # Получаем статистику
+                    c = db.cursor()
+                    c.execute("SELECT COUNT(*) FROM topics")
+                    topics_count = c.fetchone()[0] or 0
+                    c.execute("SELECT COUNT(*) FROM replies")
+                    replies_count = c.fetchone()[0] or 0
+                    
+                    bot.send_message(message.chat.id,
+                                    f"✅ **БАЗА УСПЕШНО ВОССТАНОВЛЕНА!**\n\n"
+                                    f"🔐 Шифрование: AES-256\n"
+                                    f"📊 Размер: {len(decrypted):,} байт\n"
+                                    f"📈 Статистика:\n"
+                                    f"   • Тем: {topics_count}\n"
+                                    f"   • Ответов: {replies_count}\n\n"
+                                    f"🔄 Перезапусти бота: /start")
+                    
+                    logger.info(f"🔓 База восстановлена из шифрования админом {user_id}")
+                
+                # Очищаем сессию
+                del restore_sessions[user_id]
+    
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Отправь число (например: 3)")
+    except Exception as e:
+        logger.error(f"Ошибка в restore session: {e}")
+        bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
+        if user_id in restore_sessions:
+            del restore_sessions[user_id]
+
+@bot.message_handler(commands=['whoami'])
+def whoami_command(message):
+    """Проверка, является ли пользователь админом"""
+    user_id = message.from_user.id
+    username = message.from_user.username or "без username"
+    
+    if user_id == ADMIN_ID:
+        bot.send_message(message.chat.id,
+                        f"👑 **ВЫ АДМИНИСТРАТОР**\n\n"
+                        f"ID: `{user_id}`\n"
+                        f"Username: @{username}\n\n"
+                        f"🔐 **Секретные команды:**\n"
+                        f"• /secure_save - зашифровать базу\n"
+                        f"• /secure_restore - восстановить\n"
+                        f"• /cancel_restore - отмена\n"
+                        f"• /whoami - эта информация",
+                        parse_mode='Markdown')
+    else:
+        bot.send_message(message.chat.id,
+                        f"👤 **ВЫ ПОЛЬЗОВАТЕЛЬ**\n\n"
+                        f"ID: `{user_id}`\n"
+                        f"Username: @{username}",
+                        parse_mode='Markdown')
+    
+    # Удаляем команду
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except:
+        pass
+
+@bot.message_handler(commands=['db_info'])
+def db_info_command(message):
+    """Информация о базе данных (только админ)"""
+    user_id = message.from_user.id
+    
+    if user_id != ADMIN_ID:
+        bot.send_message(message.chat.id, "❌ Команда не найдена")
+        return
+    
+    try:
+        if not os.path.exists(DB_NAME):
+            bot.send_message(message.chat.id, "📭 База данных не найдена")
+            return
+        
+        # Статистика базы
+        c = db.cursor()
+        
+        c.execute("SELECT COUNT(*) FROM topics")
+        topics_count = c.fetchone()[0] or 0
+        
+        c.execute("SELECT COUNT(*) FROM replies")
+        replies_count = c.fetchone()[0] or 0
+        
+        c.execute("SELECT COUNT(*) FROM user_stats")
+        users_count = c.fetchone()[0] or 0
+        
+        file_size = os.path.getsize(DB_NAME)
+        
+        text = f"""📊 **ИНФОРМАЦИЯ О БАЗЕ ДАННЫХ**
+
+📍 Путь: `{DB_NAME}`
+💾 Размер: {file_size:,} байт
+
+📈 **Статистика:**
+• Тем: {topics_count:,}
+• Ответов: {replies_count:,}
+• Пользователей: {users_count:,}
+
+🛠 **Команды админа:**
+• `/secure_save` - зашифровать и сохранить
+• `/secure_restore` - восстановить
+• `/db_info` - эта информация
+• `/whoami` - проверить права
+
+⚠️ **ВАЖНО:** База в `/tmp` очищается при перезапуске!
+Делайте бэкапы перед обновлением кода!"""
+        
+        bot.send_message(message.chat.id, text, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении информации о БД: {e}")
+        bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
+
 # ==================== ИГНОРИРОВАНИЕ ВСЕХ СООБЩЕНИЙ В ГРУППАХ ====================
 @bot.message_handler(func=lambda message: message.chat.type in ['group', 'supergroup', 'channel'])
 def ignore_group_messages(message):
@@ -2873,11 +3183,26 @@ def ignore_group_callbacks(call):
     logger.info(f"Игнорируем колбэк в групповом чате {call.message.chat.type}: {call.data} от пользователя {call.from_user.id}")
     return  # Просто игнорируем
 
-# ==================== ЗАПУСК ДЛЯ RAILWAY ====================
+# ==================== ЗАПУСК БОТА ДЛЯ RAILWAY ====================
 if __name__ == '__main__':
+    # Создаем директорию /tmp если нужно
+    os.makedirs("/tmp", exist_ok=True)
+    
     logger.info("🗄️ Бот 'Архив мыслей' запущен...")
-    logger.info(f"📂 Новая база данных: {DB_NAME}")
-    logger.info("👤 Система уникальных имен 'аномин_XXXX' активирована")
+    logger.info(f"📂 База данных: {DB_NAME}")
+    logger.info(f"🔐 Ключ шифрования: {'Установлен' if ENCRYPTION_KEY else 'Не установлен'}")
+    
+    # Проверяем существует ли база
+    if os.path.exists(DB_NAME):
+        size = os.path.getsize(DB_NAME)
+        logger.info(f"✅ Используем существующую базу ({size:,} байт)")
+    else:
+        logger.info("🆕 Создаем новую базу данных")
+    
+    # Инициализируем базу
+    db = init_db()
+    
+    logger.info("👤 Система уникальных имен 'аноним_XXXX' активирована")
     logger.info("🔔 Система уведомлений активирована")
     logger.info("🧹 Функция удаления предыдущих сообщений активирована")
     logger.info("🔄 Система уникального просмотра тем активирована")
@@ -2890,59 +3215,81 @@ if __name__ == '__main__':
     logger.info("📌 В групповых чатах бот игнорирует все сообщения кроме /top")
     logger.info("💬 В личных чатах работает полный функционал")
     
-    # Очищаем невалидные жалобы при запуске
-    cleanup_invalid_reports()
-    
     if ADMIN_ID:
         logger.info(f"⚙️ Администратор: {ADMIN_ID}")
     else:
-        logger.warning("⚠️ ID администратора не установлен. Установите ADMIN_ID в настройках.")
+        logger.warning("⚠️ ID администратора не установлен. Админские команды не будут работать.")
     
-    # Для Railway: определяем порт из переменной окружения
+    # Очищаем невалидные жалобы при запуске
+    cleanup_invalid_reports()
+    
+    # ========== RAILWAY ЗАПУСК ==========
     PORT = int(os.environ.get('PORT', 8080))
     
-    # Удаляем вебхук перед настройкой
-    bot.remove_webhook()
-    
-    try:
-        # Пытаемся использовать вебхук (для Railway)
-        webhook_url = os.environ.get('WEBHOOK_URL')
-        if webhook_url:
-            logger.info(f"🚀 Используем вебхук на Railway: {webhook_url}")
-            bot.set_webhook(url=f"{webhook_url}/{BOT_TOKEN}")
-            
-            # Запускаем веб-сервер для обработки вебхуков
-            from flask import Flask, request
-            app = Flask(__name__)
-            
-            @app.route(f'/{BOT_TOKEN}', methods=['POST'])
-            def webhook():
-                if request.headers.get('content-type') == 'application/json':
-                    json_string = request.get_data().decode('utf-8')
-                    update = telebot.types.Update.de_json(json_string)
-                    bot.process_new_updates([update])
-                    return ''
-                return 'Bad request', 400
-            
-            @app.route('/')
-            def index():
-                return 'Bot is running on Railway!'
-            
-            logger.info(f"🌐 Запускаем Flask сервер на порту {PORT}")
-            app.run(host='0.0.0.0', port=PORT)
-        else:
-            # Если нет WEBHOOK_URL, используем polling (для локальной разработки)
-            logger.info("🔄 Используем polling режим")
+    # Проверяем, находимся ли мы в Railway
+    if 'RAILWAY_ENVIRONMENT' in os.environ:
+        logger.info(f"🚀 Запуск в Railway на порту {PORT}")
+        
+        # Удаляем старый вебхук
+        try:
             bot.remove_webhook()
+            time.sleep(1)
+        except:
+            pass
+        
+        # Получаем домен Railway
+        RAILWAY_PUBLIC_DOMAIN = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
+        
+        if RAILWAY_PUBLIC_DOMAIN:
+            # Настраиваем вебхук
+            webhook_url = f'https://{RAILWAY_PUBLIC_DOMAIN}/{BOT_TOKEN}'
+            logger.info(f"🌐 Вебхук URL: {webhook_url}")
             
+            try:
+                bot.set_webhook(url=webhook_url)
+                logger.info("✅ Вебхук установлен")
+            except Exception as e:
+                logger.error(f"❌ Ошибка установки вебхука: {e}")
+        
+        # Запускаем Flask сервер
+        from flask import Flask, request
+        
+        app = Flask(__name__)
+        
+        @app.route(f'/{BOT_TOKEN}', methods=['POST'])
+        def webhook():
+            if request.headers.get('content-type') == 'application/json':
+                json_string = request.get_data().decode('utf-8')
+                update = telebot.types.Update.de_json(json_string)
+                bot.process_new_updates([update])
+                return ''
+            return 'Bad request', 400
+        
+        @app.route('/')
+        def home():
+            return '🤖 Бот "Архив мыслей" работает!'
+        
+        @app.route('/health')
+        def health():
+            return 'OK', 200
+        
+        logger.info(f"✅ Запускаем Flask сервер на 0.0.0.0:{PORT}")
+        app.run(host='0.0.0.0', port=PORT)
+        
+    else:
+        # ЛОКАЛЬНЫЙ ЗАПУСК (polling)
+        logger.info("💻 Локальный запуск (polling)")
+        
+        try:
             bot.polling(
                 none_stop=True,
                 timeout=30,
                 interval=2,
                 skip_pending=True
             )
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен пользователем")
-    except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
-        raise
+        except KeyboardInterrupt:
+            logger.info("Бот остановлен пользователем")
+        except Exception as e:
+            logger.error(f"Критическая ошибка: {e}")
+            logger.error("Перезапуск через 10 секунд...")
+            time.sleep(10)
