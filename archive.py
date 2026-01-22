@@ -2872,11 +2872,11 @@ def ignore_group_callbacks(call):
     logger.info(f"Игнорируем колбэк в групповом чате {call.message.chat.type}: {call.data} от пользователя {call.from_user.id}")
     return  # Просто игнорируем
 
-# ==================== ЗАПУСК ====================
+# ==================== ЗАПУСК ДЛЯ RAILWAY ====================
 if __name__ == '__main__':
     logger.info("🗄️ Бот 'Архив мыслей' запущен...")
     logger.info(f"📂 Новая база данных: {DB_NAME}")
-    logger.info("👤 Система уникальных имен 'аноним_XXXX' активирована")
+    logger.info("👤 Система уникальных имен 'аномин_XXXX' активирована")
     logger.info("🔔 Система уведомлений активирована")
     logger.info("🧹 Функция удаления предыдущих сообщений активирована")
     logger.info("🔄 Система уникального просмотра тем активирована")
@@ -2897,17 +2897,51 @@ if __name__ == '__main__':
     else:
         logger.warning("⚠️ ID администратора не установлен. Установите ADMIN_ID в настройках.")
     
-    # Удаляем вебхук и запускаем бота
+    # Для Railway: определяем порт из переменной окружения
+    PORT = int(os.environ.get('PORT', 8080))
+    
+    # Удаляем вебхук перед настройкой
     bot.remove_webhook()
     
     try:
-        bot.polling(
-            none_stop=True,
-            timeout=30,
-            interval=2,
-            skip_pending=True
-        )
+        # Пытаемся использовать вебхук (для Railway)
+        webhook_url = os.environ.get('WEBHOOK_URL')
+        if webhook_url:
+            logger.info(f"🚀 Используем вебхук на Railway: {webhook_url}")
+            bot.set_webhook(url=f"{webhook_url}/{BOT_TOKEN}")
+            
+            # Запускаем веб-сервер для обработки вебхуков
+            from flask import Flask, request
+            app = Flask(__name__)
+            
+            @app.route(f'/{BOT_TOKEN}', methods=['POST'])
+            def webhook():
+                if request.headers.get('content-type') == 'application/json':
+                    json_string = request.get_data().decode('utf-8')
+                    update = telebot.types.Update.de_json(json_string)
+                    bot.process_new_updates([update])
+                    return ''
+                return 'Bad request', 400
+            
+            @app.route('/')
+            def index():
+                return 'Bot is running on Railway!'
+            
+            logger.info(f"🌐 Запускаем Flask сервер на порту {PORT}")
+            app.run(host='0.0.0.0', port=PORT)
+        else:
+            # Если нет WEBHOOK_URL, используем polling (для локальной разработки)
+            logger.info("🔄 Используем polling режим")
+            bot.remove_webhook()
+            
+            bot.polling(
+                none_stop=True,
+                timeout=30,
+                interval=2,
+                skip_pending=True
+            )
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем")
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")
+        raise
