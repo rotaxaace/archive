@@ -8,12 +8,19 @@ import html
 import re
 
 # ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = "7904358040:AAETz5ZMkutIemCL8askvdMVrmg7ZF-7r_Q"
-DB_NAME = "thoughts_archive.db"  # НОВОЕ ИМЯ БАЗЫ ДАННЫХ
-ADMIN_ID = 7808663131  # Здесь установите ID администратора
+import os
 
-# Лимиты
-DAILY_TOPIC_LIMIT = 5  # Максимум 5 тем в день на пользователя
+# Получаем из переменных окружения Railway
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+
+# Безопасная проверка токена
+if not BOT_TOKEN:
+    # В Railway эта ошибка будет видна в логах
+    raise ValueError("BOT_TOKEN не найден в переменных окружения")
+
+DB_NAME = "thoughts_archive.db"
+DAILY_TOPIC_LIMIT = 5
 
 # Фотографии
 PHOTOS = {
