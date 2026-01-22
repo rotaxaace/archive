@@ -19,7 +19,7 @@ if not BOT_TOKEN:
     # В Railway эта ошибка будет видна в логах
     raise ValueError("BOT_TOKEN не найден в переменных окружения")
 
-DB_NAME = "thoughts_archive.db"
+DB_NAME = "/data/thoughts_archive.db"  # ← ТОЛЬКО ЭТУ СТРОКУ МЕНЯЕШЬ
 DAILY_TOPIC_LIMIT = 5
 
 # Фотографии
