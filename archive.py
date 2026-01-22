@@ -6,6 +6,7 @@ import logging
 import time
 import html
 import re
+import os
 
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
