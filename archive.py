@@ -6,128 +6,14 @@ import logging
 import time
 import html
 import re
-import os
-# ==================== НАСТРОЙКИ ====================
-
-# Получаем из переменных окружения Railway
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-DATABASE_URL = os.environ.get("DATABASE_URL") 
-
-# Безопасная проверка токена
-if not BOT_TOKEN:
-    # В Railway эта ошибка будет видна в логах
-    raise ValueError("BOT_TOKEN не найден в переменных окружения")
-
-DAILY_TOPIC_LIMIT = 5
-
-# Фотографии
-PHOTOS = {
-    'start': 'https://ibb.co/5gc6GcCt',
-    'new_topic': 'https://ibb.co/C5Zy1VwQ',
-    'random': 'https://ibb.co/N645QgdB',
-    'my_topics': 'https://ibb.co/mVfrSdJy',
-    'popular': 'https://ibb.co/vC4GvZyV',
-    'topic_created': 'https://ibb.co/MLS0xmc',
-    'reply_created': 'https://ibb.co/RpMkjtKf',
-    'view_topic': 'https://ibb.co/zWdFvwTF',
-    'notification': 'https://ibb.co/mCDDWKyG',
-    'profile': 'https://ibb.co/YBynCpDG',
-    'admin': 'https://ibb.co/5gc6GcCt',
-    'report': 'https://ibb.co/N25WXBsz',
-    'top': 'https://ibb.co/hxqVGCHV',
-    'limit': 'https://ibb.co/xqZZBn1v'
-}
-
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# ==================== БАЗА ДАННЫХ ====================
-# ==================== POSTGRESQL БАЗА ДАННЫХ ====================
-import psycopg2
-from psycopg2 import pool
-import json
-
-# Получаем URL базы из Railway Variables
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
-# Создаем пул соединений
-connection_pool = None
-
-def init_postgres():
-    """Инициализация PostgreSQL базы"""
-    global connection_pool
-    
-    if not DATABASE_URL:
-        logger.error("❌ DATABASE_URL не найден в переменных окружения")
-        logger.error("✅ Добавьте DATABASE_URL в Railway Variables")
-        raise ValueError("DATABASE_URL не найден")
-    
-    try:
-        # Создаем пул соединений
-        connection_pool = psycopg2.pool.SimpleConnectionPool(
-            1, 20, DATABASE_URL, sslmode='require'
-        )
-        
-        # Создаем таблицы если их нет
-        conn = connection_pool.getconn()
-        cursor = conn.cursor()
-        
-        # Таблица тем
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS topics (
-                id SERIAL PRIMARY KEY,
-                text TEXT NOT NULL,
-                user_id BIGINT NOT NULL,
-                is_active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Таблица ответов
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS replies (
-                id SERIAL PRIMARY KEY,
-                topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
-                text TEXT NOT NULL,
-                user_id BIGINT NOT NULL,
-import telebot
-import sqlite3
-import random
-from datetime import datetime, timedelta
-import logging
-import time
-import html
-import re
-import os
 
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+DB_NAME = "thoughts_archive.db"  # НОВОЕ ИМЯ БАЗЫ ДАННЫХ
 
-# Безопасная проверка токена
-if not BOT_TOKEN:
-    # В Railway эта ошибка будет видна в логах
-    raise ValueError("BOT_TOKEN не найден в переменных окружения")
-
-# Пытаемся использовать /data, если есть, иначе локально
-if os.path.exists('/data'):
-    DB_NAME = "/data/thoughts_archive.db"
-    print("✅ Использую постоянное хранилище /data")
-else:
-    DB_NAME = "thoughts_archive.db"
-    print("⚠️ Использую временное хранилище")
-
-DAILY_TOPIC_LIMIT = 5
+# Лимиты
+DAILY_TOPIC_LIMIT = 5  # Максимум 5 тем в день на пользователя
 
 # Фотографии
 PHOTOS = {
@@ -2988,55 +2874,33 @@ def ignore_group_callbacks(call):
 
 # ==================== ЗАПУСК ====================
 if __name__ == '__main__':
-    # Логи при запуске
     logger.info("🗄️ Бот 'Архив мыслей' запущен...")
+    logger.info(f"📂 Новая база данных: {DB_NAME}")
+    logger.info("👤 Система уникальных имен 'аноним_XXXX' активирована")
+    logger.info("🔔 Система уведомлений активирована")
+    logger.info("🧹 Функция удаления предыдущих сообщений активирована")
+    logger.info("🔄 Система уникального просмотра тем активирована")
+    logger.info("⚠️ Система жалоб и модерации активирована")
+    logger.info("👤 Система личных кабинетов активирована")
+    logger.info("✏️ Система имен пользователей активирована")
+    logger.info("🏆 Команда /top активирована")
+    logger.info(f"📊 Система статусов активирована ({len(RANK_SYSTEM)} рангов)")
+    logger.info(f"📅 Дневной лимит тем: {DAILY_TOPIC_LIMIT}")
+    logger.info("📌 В групповых чатах бот игнорирует все сообщения кроме /top")
+    logger.info("💬 В личных чатах работает полный функционал")
     
-    # Очистка невалидных жалоб
+    # Очищаем невалидные жалобы при запуске
     cleanup_invalid_reports()
     
-    # Удаляем старый вебхук
+    if ADMIN_ID:
+        logger.info(f"⚙️ Администратор: {ADMIN_ID}")
+    else:
+        logger.warning("⚠️ ID администратора не установлен. Установите ADMIN_ID в настройках.")
+    
+    # Удаляем вебхук и запускаем бота
     bot.remove_webhook()
     
-    # ЗАПУСКАЕМ ВЕБ-СЕРВЕР ДЛЯ RAILWAY (простой вариант)
-    import os
-    port = int(os.environ.get("PORT", 5000))
-    
-    # Простой HTTP-сервер для Railway
     try:
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-        
-        class SimpleHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path == '/health':
-                    self.send_response(200)
-                    self.send_header('Content-type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(b'{"status": "ok"}')
-                else:
-                    self.send_response(200)
-                    self.send_header('Content-type', 'text/html')
-                    self.end_headers()
-                    self.wfile.write(b'<h1>Bot is running!</h1>')
-            
-            def log_message(self, format, *args):
-                pass  # Отключаем логи
-        
-        # Запускаем в отдельном потоке
-        import threading
-        def run_server():
-            server = HTTPServer(('0.0.0.0', port), SimpleHandler)
-            logger.info(f"🌐 Веб-сервер запущен на порту {port}")
-            server.serve_forever()
-        
-        server_thread = threading.Thread(target=run_server, daemon=True)
-        server_thread.start()
-        
-    except ImportError:
-        logger.warning("Не удалось запустить веб-сервер, но бот продолжит работу")
-    
-    # ЗАПУСК ТЕЛЕГРАМ БОТА
-    try:
-        logger.info("🤖 Запускаю Telegram бота...")
         bot.polling(
             none_stop=True,
             timeout=30,
