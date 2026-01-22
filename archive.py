@@ -6,20 +6,19 @@ import logging
 import time
 import html
 import re
-
-# ==================== НАСТРОЙКИ ====================
 import os
+# ==================== НАСТРОЙКИ ====================
 
 # Получаем из переменных окружения Railway
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+DATABASE_URL = os.environ.get("DATABASE_URL") 
 
 # Безопасная проверка токена
 if not BOT_TOKEN:
     # В Railway эта ошибка будет видна в логах
     raise ValueError("BOT_TOKEN не найден в переменных окружения")
 
-DB_NAME = "/data/thoughts_archive.db"  # ← ТОЛЬКО ЭТУ СТРОКУ МЕНЯЕШЬ
 DAILY_TOPIC_LIMIT = 5
 
 # Фотографии
@@ -52,111 +51,172 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== БАЗА ДАННЫХ ====================
-def init_db():
-    """Инициализация новой базы данных"""
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    c = conn.cursor()
-    
-    # Таблица тем
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS topics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            is_active BOOLEAN DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Таблица ответов
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS replies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            topic_id INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            is_active BOOLEAN DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # Таблица жалоб
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            topic_id INTEGER NOT NULL,
-            reporter_id INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            admin_action TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            resolved_at TIMESTAMP,
-            admin_id INTEGER,
-            FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # Таблица банов
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS bans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL UNIQUE,
-            reason TEXT NOT NULL,
-            admin_id INTEGER NOT NULL,
-            banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            unbanned_at TIMESTAMP,
-            is_active BOOLEAN DEFAULT 1
-        )
-    ''')
-    
-    # Таблица статистики пользователей
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_stats (
-            user_id INTEGER PRIMARY KEY,
-            topics_created INTEGER DEFAULT 0,
-            replies_written INTEGER DEFAULT 0,
-            replies_received INTEGER DEFAULT 0,
-            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Таблица никнеймов пользователей
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_names (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT NOT NULL UNIQUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Таблица для дневных лимитов
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS daily_limits (
-            user_id INTEGER NOT NULL,
-            date DATE NOT NULL,
-            topics_created INTEGER DEFAULT 0,
-            PRIMARY KEY (user_id, date)
-        )
-    ''')
-    
-    # Индексы для оптимизации
-    c.execute('CREATE INDEX IF NOT EXISTS idx_topics_user_id ON topics(user_id)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_topics_active ON topics(is_active)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_replies_topic_id ON replies(topic_id)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_replies_user_id ON replies(user_id)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_bans_active ON bans(is_active)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_bans_unbanned ON bans(unbanned_at)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_user_names_username ON user_names(username)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_daily_limits_date ON daily_limits(date)')
-    
-    conn.commit()
-    return conn
+# ==================== POSTGRESQL БАЗА ДАННЫХ ====================
+import psycopg2
+from psycopg2 import pool
+import json
 
-db = init_db()
+# Получаем URL базы из Railway Variables
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Создаем пул соединений
+connection_pool = None
+
+def init_postgres():
+    """Инициализация PostgreSQL базы"""
+    global connection_pool
+    
+    if not DATABASE_URL:
+        logger.error("❌ DATABASE_URL не найден в переменных окружения")
+        logger.error("✅ Добавьте DATABASE_URL в Railway Variables")
+        raise ValueError("DATABASE_URL не найден")
+    
+    try:
+        # Создаем пул соединений
+        connection_pool = psycopg2.pool.SimpleConnectionPool(
+            1, 20, DATABASE_URL, sslmode='require'
+        )
+        
+        # Создаем таблицы если их нет
+        conn = connection_pool.getconn()
+        cursor = conn.cursor()
+        
+        # Таблица тем
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS topics (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Таблица ответов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS replies (
+                id SERIAL PRIMARY KEY,
+                topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Таблица жалоб
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reports (
+                id SERIAL PRIMARY KEY,
+                topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+                reporter_id BIGINT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                admin_action TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                resolved_at TIMESTAMP,
+                admin_id BIGINT
+            )
+        ''')
+        
+        # Таблица банов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bans (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL UNIQUE,
+                reason TEXT NOT NULL,
+                admin_id BIGINT NOT NULL,
+                banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                unbanned_at TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE
+            )
+        ''')
+        
+        # Таблица статистики пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_stats (
+                user_id BIGINT PRIMARY KEY,
+                topics_created INTEGER DEFAULT 0,
+                replies_written INTEGER DEFAULT 0,
+                replies_received INTEGER DEFAULT 0,
+                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Таблица никнеймов пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_names (
+                user_id BIGINT PRIMARY KEY,
+                username VARCHAR(50) NOT NULL UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Таблица для дневных лимитов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS daily_limits (
+                user_id BIGINT NOT NULL,
+                date DATE NOT NULL,
+                topics_created INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, date)
+            )
+        ''')
+        
+        conn.commit()
+        connection_pool.putconn(conn)
+        
+        logger.info("✅ PostgreSQL база инициализирована")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации PostgreSQL: {e}")
+        return False
+
+def get_db_connection():
+    """Получить соединение с базой"""
+    return connection_pool.getconn()
+
+def return_db_connection(conn):
+    """Вернуть соединение в пул"""
+    connection_pool.putconn(conn)
+
+def execute_query(query, params=None, fetchone=False, fetchall=False, commit=False):
+    """Универсальная функция для выполнения запросов"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(query, params or ())
+        
+        if commit:
+            conn.commit()
+        
+        if fetchone:
+            result = cursor.fetchone()
+        elif fetchall:
+            result = cursor.fetchall()
+        else:
+            result = cursor.rowcount
+        
+        # Для INSERT с RETURNING получаем ID
+        if query.strip().upper().startswith('INSERT') and 'RETURNING' in query.upper():
+            result = cursor.fetchone()[0]
+        
+        return result
+        
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Ошибка SQL: {e}, Запрос: {query}, Параметры: {params}")
+        raise e
+    finally:
+        cursor.close()
+        return_db_connection(conn)
+
+# Инициализируем базу при старте
+init_postgres()
 
 # ==================== СИСТЕМА ГЕНЕРАЦИИ УНИКАЛЬНЫХ ИМЕН ====================
 def generate_unique_username():
