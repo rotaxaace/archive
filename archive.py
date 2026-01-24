@@ -11,7 +11,13 @@ import os
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-DB_NAME = "thoughts_archive.db"
+DB_NAME = "/data/thoughts_archive.db"
+
+# Создаем папку /data если её нет
+import os
+if not os.path.exists("/data"):
+    os.makedirs("/data")
+    print("📁 Создана папка /data для постоянного хранения")
 
 # Лимиты
 DAILY_TOPIC_LIMIT = 5
@@ -39,7 +45,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.FileHandler('/data.bot.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
