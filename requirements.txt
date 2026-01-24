@@ -1,5 +1,2 @@
 pyTelegramBotAPI==4.16.1
-psycopg2-binary==2.9.9
-telebot==0.0.5
-pycryptodome==3.20.0
 Flask==2.3.3
