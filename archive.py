@@ -1,37 +1,20 @@
 import telebot
-import psycopg2
+import sqlite3
 import random
 from datetime import datetime, timedelta
 import logging
+import time
 import html
 import re
 import os
-import urllib.parse as urlparse
 
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-DAILY_TOPIC_LIMIT = 5
+DB_NAME = "thoughts_archive.db"  # НОВОЕ ИМЯ БАЗЫ ДАННЫХ
 
-# PostgreSQL подключение
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if DATABASE_URL:
-    url = urlparse.urlparse(DATABASE_URL)
-    db_params = {
-        'database': url.path[1:],
-        'user': url.username,
-        'password': url.password,
-        'host': url.hostname,
-        'port': url.port
-    }
-else:
-    db_params = {
-        'database': 'railway',
-        'user': 'postgres',
-        'password': 'vaUPCSdlOJSRxhdTLjwzreixKFTQCtDy',
-        'host': 'tramway.proxy.rlwy.net',
-        'port': 38575
-    }
+# Лимиты
+DAILY_TOPIC_LIMIT = 5  # Максимум 5 тем в день на пользователя
 
 # Фотографии
 PHOTOS = {
@@ -62,28 +45,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== БАЗА ДАННЫХ POSTGRESQL ====================
-def get_db_connection():
-    """Получение соединения с PostgreSQL"""
-    try:
-        conn = psycopg2.connect(**db_params)
-        return conn
-    except Exception as e:
-        logger.error(f"Ошибка подключения к PostgreSQL: {e}")
-        raise
-
+# ==================== БАЗА ДАННЫХ ====================
 def init_db():
-    """Инициализация базы данных PostgreSQL"""
-    conn = get_db_connection()
+    """Инициализация новой базы данных с сохранением старой структуры"""
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     c = conn.cursor()
     
     # Таблица тем
     c.execute('''
         CREATE TABLE IF NOT EXISTS topics (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT NOT NULL,
-            user_id BIGINT NOT NULL,
-            is_active BOOLEAN DEFAULT TRUE,
+            user_id INTEGER NOT NULL,
+            is_active BOOLEAN DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -92,47 +66,49 @@ def init_db():
     # Таблица ответов
     c.execute('''
         CREATE TABLE IF NOT EXISTS replies (
-            id SERIAL PRIMARY KEY,
-            topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id INTEGER NOT NULL,
             text TEXT NOT NULL,
-            user_id BIGINT NOT NULL,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            user_id INTEGER NOT NULL,
+            is_active BOOLEAN DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
         )
     ''')
     
     # Таблица жалоб
     c.execute('''
         CREATE TABLE IF NOT EXISTS reports (
-            id SERIAL PRIMARY KEY,
-            topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
-            reporter_id BIGINT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id INTEGER NOT NULL,
+            reporter_id INTEGER NOT NULL,
             reason TEXT NOT NULL,
             status TEXT DEFAULT 'pending',
             admin_action TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             resolved_at TIMESTAMP,
-            admin_id BIGINT
+            admin_id INTEGER,
+            FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
         )
     ''')
     
     # Таблица банов
     c.execute('''
         CREATE TABLE IF NOT EXISTS bans (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL UNIQUE,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL UNIQUE,
             reason TEXT NOT NULL,
-            admin_id BIGINT NOT NULL,
+            admin_id INTEGER NOT NULL,
             banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             unbanned_at TIMESTAMP,
-            is_active BOOLEAN DEFAULT TRUE
+            is_active BOOLEAN DEFAULT 1
         )
     ''')
     
     # Таблица статистики пользователей
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_stats (
-            user_id BIGINT PRIMARY KEY,
+            user_id INTEGER PRIMARY KEY,
             topics_created INTEGER DEFAULT 0,
             replies_written INTEGER DEFAULT 0,
             replies_received INTEGER DEFAULT 0,
@@ -143,7 +119,7 @@ def init_db():
     # Таблица никнеймов пользователей
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_names (
-            user_id BIGINT PRIMARY KEY,
+            user_id INTEGER PRIMARY KEY,
             username TEXT NOT NULL UNIQUE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -153,23 +129,24 @@ def init_db():
     # Таблица для дневных лимитов
     c.execute('''
         CREATE TABLE IF NOT EXISTS daily_limits (
-            user_id BIGINT NOT NULL,
+            user_id INTEGER NOT NULL,
             date DATE NOT NULL,
             topics_created INTEGER DEFAULT 0,
             PRIMARY KEY (user_id, date)
         )
     ''')
     
-    # Таблица настроек уведомлений пользователей
+    # НОВАЯ ТАБЛИЦА: настройки уведомлений пользователей
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_notifications (
-            user_id BIGINT PRIMARY KEY,
-            reply_notifications BOOLEAN DEFAULT TRUE,
+            user_id INTEGER PRIMARY KEY,
+            reply_notifications BOOLEAN DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    # Создаем индексы
+    # Индексы для оптимизации
     c.execute('CREATE INDEX IF NOT EXISTS idx_topics_user_id ON topics(user_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_topics_active ON topics(is_active)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_replies_topic_id ON replies(topic_id)')
@@ -181,175 +158,269 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_daily_limits_date ON daily_limits(date)')
     
     conn.commit()
-    c.close()
-    conn.close()
-    logger.info("База данных PostgreSQL инициализирована")
+    return conn
 
-init_db()
+db = init_db()
 
-# ==================== ФУНКЦИИ ДЛЯ УВЕДОМЛЕНИЙ ====================
-def get_user_notification_setting(user_id):
-    """Получение настройки уведомлений пользователя"""
+# ==================== СИСТЕМА УВЕДОМЛЕНИЙ ПОЛЬЗОВАТЕЛЕЙ ====================
+def get_user_notification_settings(user_id):
+    """Получение настроек уведомлений пользователя"""
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('SELECT reply_notifications FROM user_notifications WHERE user_id = %s', (user_id,))
+        c = db.cursor()
+        c.execute('SELECT reply_notifications FROM user_notifications WHERE user_id = ?', (user_id,))
         result = c.fetchone()
-        c.close()
-        conn.close()
         
         if result:
-            return result[0]
+            return {'reply_notifications': bool(result[0])}
         else:
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute('INSERT INTO user_notifications (user_id, reply_notifications) VALUES (%s, TRUE)', (user_id,))
-            conn.commit()
-            c.close()
-            conn.close()
-            return True
+            # Создаем запись по умолчанию
+            c.execute('INSERT INTO user_notifications (user_id, reply_notifications) VALUES (?, 1)', (user_id,))
+            db.commit()
+            return {'reply_notifications': True}
     except Exception as e:
         logger.error(f"Ошибка при получении настроек уведомлений пользователя {user_id}: {e}")
+        return {'reply_notifications': True}
+
+def set_user_notification_settings(user_id, reply_notifications):
+    """Обновление настроек уведомлений пользователя"""
+    try:
+        c = db.cursor()
+        c.execute('''
+            INSERT OR REPLACE INTO user_notifications (user_id, reply_notifications, updated_at) 
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        ''', (user_id, 1 if reply_notifications else 0))
+        db.commit()
         return True
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении настроек уведомлений пользователя {user_id}: {e}")
+        return False
 
 def toggle_user_notifications(user_id):
-    """Переключение уведомлений пользователя"""
+    """Переключение настроек уведомлений пользователя"""
     try:
-        current_setting = get_user_notification_setting(user_id)
-        new_setting = not current_setting
+        current_settings = get_user_notification_settings(user_id)
+        new_setting = not current_settings['reply_notifications']
+        success = set_user_notification_settings(user_id, new_setting)
         
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO user_notifications (user_id, reply_notifications, updated_at) 
-            VALUES (%s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (user_id) 
-            DO UPDATE SET reply_notifications = %s, updated_at = CURRENT_TIMESTAMP
-        ''', (user_id, new_setting, new_setting))
-        conn.commit()
-        c.close()
-        conn.close()
+        if success:
+            logger.info(f"Настройки уведомлений пользователя {user_id} изменены на: reply_notifications={new_setting}")
         
-        return new_setting
+        return success, new_setting
     except Exception as e:
         logger.error(f"Ошибка при переключении уведомлений пользователя {user_id}: {e}")
-        return current_setting
+        return False, current_settings['reply_notifications']
+
+def should_notify_user(user_id):
+    """Проверка, нужно ли отправлять уведомление пользователю"""
+    try:
+        # Проверяем, не забанен ли пользователь
+        if is_user_banned(user_id):
+            return False
+        
+        # Проверяем настройки уведомлений
+        settings = get_user_notification_settings(user_id)
+        return settings['reply_notifications']
+    except Exception as e:
+        logger.error(f"Ошибка при проверке уведомлений пользователя {user_id}: {e}")
+        return True  # По умолчанию отправляем
 
 # ==================== СИСТЕМА ГЕНЕРАЦИИ УНИКАЛЬНЫХ ИМЕН ====================
 def generate_unique_username():
     """Генерация уникального имени пользователя формата 'аноним_XXXX'"""
     while True:
+        # Генерируем случайные 4 цифры
         random_digits = ''.join([str(random.randint(0, 9)) for _ in range(4)])
         username = f"аноним_{random_digits}"
         
-        try:
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute('SELECT user_id FROM user_names WHERE username = %s', (username,))
-            result = c.fetchone()
-            c.close()
-            conn.close()
-            
-            if not result:
-                return username
-        except Exception as e:
-            logger.error(f"Ошибка при генерации уникального имени: {e}")
-            return f"аноним_{random.randint(1000, 9999)}"
+        # Проверяем, не занято ли это имя
+        c = db.cursor()
+        c.execute('SELECT user_id FROM user_names WHERE username = ?', (username,))
+        if not c.fetchone():
+            return username
 
 def get_username(user_id):
     """Получение имени пользователя, создание уникального если нет"""
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('SELECT username FROM user_names WHERE user_id = %s', (user_id,))
+        c = db.cursor()
+        c.execute('SELECT username FROM user_names WHERE user_id = ?', (user_id,))
         result = c.fetchone()
         
         if result and result[0]:
-            username = result[0]
-            c.close()
-            conn.close()
-            return username
+            return result[0]
         else:
+            # Генерируем уникальное имя "аноним_XXXX"
             username = generate_unique_username()
-            c.execute('''
-                INSERT INTO user_names (user_id, username) 
-                VALUES (%s, %s)
-                ON CONFLICT (user_id) DO NOTHING
-            ''', (user_id, username))
-            conn.commit()
-            c.close()
-            conn.close()
+            c.execute('INSERT OR IGNORE INTO user_names (user_id, username) VALUES (?, ?)', (user_id, username))
+            db.commit()
+            logger.info(f"Создано уникальное имя {username} для пользователя {user_id}")
             return username
     except Exception as e:
         logger.error(f"Ошибка при получении имени пользователя {user_id}: {e}")
+        # Резервный вариант если что-то пошло не так
         return f"аноним_{user_id % 10000:04d}"
 
 # ==================== СИСТЕМА СТАТУСОВ ====================
 RANK_SYSTEM = {
-    1: {'name': '👶 НОВИЧОК', 'emoji': '👶', 'requirements': {'max_topics': 4, 'max_replies': 9}, 'next_rank': 2},
-    2: {'name': '🧒 ПОСЕТИТЕЛЬ', 'emoji': '🧒', 'requirements': {'max_topics': 9, 'max_replies': 24}, 'next_rank': 3},
-    3: {'name': '👨 УЧАСТНИК', 'emoji': '👨', 'requirements': {'max_topics': 19, 'max_replies': 49}, 'next_rank': 4},
-    4: {'name': '👨‍💼 АКТИВИСТ', 'emoji': '👨‍💼', 'requirements': {'max_topics': 34, 'max_replies': 99}, 'next_rank': 5},
-    5: {'name': '👨‍🔬 АВТОР', 'emoji': '👨‍🔬', 'requirements': {'max_topics': 54, 'max_replies': 199}, 'next_rank': 6},
-    6: {'name': '👨‍🎓 МЫСЛИТЕЛЬ', 'emoji': '👨‍🎓', 'requirements': {'max_topics': 84, 'max_replies': 399}, 'next_rank': 7},
-    7: {'name': '👨‍🚀 ДИСКУТАНТ', 'emoji': '👨‍🚀', 'requirements': {'max_topics': 129, 'max_replies': 699}, 'next_rank': 8},
-    8: {'name': '👨‍✈️ ФИЛОСОФ', 'emoji': '👨‍✈️', 'requirements': {'max_topics': 199, 'max_replies': 1199}, 'next_rank': 9},
-    9: {'name': '👑 МАСТЕР', 'emoji': '👑', 'requirements': {'max_topics': 299, 'max_replies': 1999}, 'next_rank': 10},
-    10: {'name': '⚡ ЛЕГЕНДА', 'emoji': '⚡', 'requirements': {'max_topics': 999999, 'max_replies': 999999}, 'next_rank': None}
+    1: {
+        'name': '👶 НОВИЧОК',
+        'emoji': '👶',
+        'requirements': {
+            'max_topics': 4,
+            'max_replies': 9
+        },
+        'next_rank': 2
+    },
+    2: {
+        'name': '🧒 ПОСЕТИТЕЛЬ',
+        'emoji': '🧒',
+        'requirements': {
+            'max_topics': 9,
+            'max_replies': 24
+        },
+        'next_rank': 3
+    },
+    3: {
+        'name': '👨 УЧАСТНИК',
+        'emoji': '👨',
+        'requirements': {
+            'max_topics': 19,
+            'max_replies': 49
+        },
+        'next_rank': 4
+    },
+    4: {
+        'name': '👨‍💼 АКТИВИСТ',
+        'emoji': '👨‍💼',
+        'requirements': {
+            'max_topics': 34,
+            'max_replies': 99
+        },
+        'next_rank': 5
+    },
+    5: {
+        'name': '👨‍🔬 АВТОР',
+        'emoji': '👨‍🔬',
+        'requirements': {
+            'max_topics': 54,
+            'max_replies': 199
+        },
+        'next_rank': 6
+    },
+    6: {
+        'name': '👨‍🎓 МЫСЛИТЕЛЬ',
+        'emoji': '👨‍🎓',
+        'requirements': {
+            'max_topics': 84,
+            'max_replies': 399
+        },
+        'next_rank': 7
+    },
+    7: {
+        'name': '👨‍🚀 ДИСКУТАНТ',
+        'emoji': '👨‍🚀',
+        'requirements': {
+            'max_topics': 129,
+            'max_replies': 699
+        },
+        'next_rank': 8
+    },
+    8: {
+        'name': '👨‍✈️ ФИЛОСОФ',
+        'emoji': '👨‍✈️',
+        'requirements': {
+            'max_topics': 199,
+            'max_replies': 1199
+        },
+        'next_rank': 9
+    },
+    9: {
+        'name': '👑 МАСТЕР',
+        'emoji': '👑',
+        'requirements': {
+            'max_topics': 299,
+            'max_replies': 1999
+        },
+        'next_rank': 10
+    },
+    10: {
+        'name': '⚡ ЛЕГЕНДА',
+        'emoji': '⚡',
+        'requirements': {
+            'max_topics': 999999,
+            'max_replies': 999999
+        },
+        'next_rank': None
+    }
 }
 
 def get_user_rank(user_id):
+    """Определение ранга пользователя по статистике"""
     stats = get_user_statistics(user_id)
     return get_user_rank_by_stats(stats)
 
 def get_user_rank_by_stats(stats):
+    """Определение ранга по статистике"""
     topics = stats['topics_created']
     replies = stats['replies_written']
     
     for rank_id, rank_info in RANK_SYSTEM.items():
         req = rank_info['requirements']
+        
+        # Проверяем, подходит ли пользователь под этот ранг
         if topics <= req['max_topics'] and replies <= req['max_replies']:
             return rank_id
     
+    # Если не подошел ни под один ранг, возвращаем максимальный
     return 10
 
 def get_rank_progress(user_id):
+    """Получение прогресса до следующего ранга"""
     stats = get_user_statistics(user_id)
     current_rank = get_user_rank_by_stats(stats)
     
-    if current_rank >= 10:
+    if current_rank >= 10:  # Максимальный ранг
         return {
             'current_rank': current_rank,
             'next_rank': None,
             'progress': 100,
-            'remaining': {'topics': 0, 'replies': 0}
+            'remaining': {
+                'topics': 0,
+                'replies': 0
+            }
         }
     
     next_rank = current_rank + 1
     next_req = RANK_SYSTEM[next_rank]['requirements']
     
+    # Вычисляем прогресс по каждому параметру
     topics_progress = min(100, int((stats['topics_created'] / next_req['max_topics']) * 100)) if next_req['max_topics'] > 0 else 100
     replies_progress = min(100, int((stats['replies_written'] / next_req['max_replies']) * 100)) if next_req['max_replies'] > 0 else 100
     
+    # Общий прогресс - среднее значение
     total_progress = (topics_progress + replies_progress) // 2
+    
+    # Оставшиеся требования
+    remaining = {
+        'topics': max(0, next_req['max_topics'] - stats['topics_created']),
+        'replies': max(0, next_req['max_replies'] - stats['replies_written'])
+    }
     
     return {
         'current_rank': current_rank,
         'next_rank': next_rank,
         'progress': total_progress,
-        'remaining': {
-            'topics': max(0, next_req['max_topics'] - stats['topics_created']),
-            'replies': max(0, next_req['max_replies'] - stats['replies_written'])
-        }
+        'remaining': remaining
     }
 
 def get_progress_bar(progress, length=10):
+    """Создание графического прогресс-бара"""
     filled = int(progress / 100 * length)
     empty = length - filled
     return '▰' * filled + '▱' * empty
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def format_datetime(dt_str):
+    """Форматирование даты для пользователя"""
     try:
         dt = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
         return dt.strftime('%d.%m.%Y %H:%M')
@@ -357,6 +428,7 @@ def format_datetime(dt_str):
         return dt_str
 
 def format_timedelta(td):
+    """Форматирование разницы времени"""
     try:
         if not td or not hasattr(td, 'days'):
             return "неизвестно"
@@ -375,16 +447,21 @@ def format_timedelta(td):
         return "неизвестно"
 
 def sanitize_html(text):
+    """Очистка HTML от проблемных символов"""
     if not text:
         return text
     
+    # Экранируем HTML символы
     text = html.escape(text)
+    
+    # Восстанавливаем разрешенные теги
     text = text.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
     text = text.replace('&lt;i&gt;', '<i>').replace('&lt;/i&gt;', '</i>')
     
     return text
 
 def validate_username(username):
+    """Проверка валидности имени пользователя"""
     if not username:
         return False, "Имя не может быть пустым"
     
@@ -394,6 +471,7 @@ def validate_username(username):
     if len(username) > 12:
         return False, "Имя должно быть не более 12 символов"
     
+    # Разрешаем буквы (русские и английские), цифры и нижнее подчеркивание
     pattern = r'^[a-zA-Zа-яА-ЯёЁ0-9_]+$'
     if not re.match(pattern, username):
         return False, "Можно использовать только буквы, цифры и нижнее подчеркивание"
@@ -401,137 +479,149 @@ def validate_username(username):
     return True, "OK"
 
 def set_username(user_id, username):
+    """Установка имени пользователя"""
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
+        c = db.cursor()
         
-        c.execute('SELECT user_id FROM user_names WHERE username = %s AND user_id != %s', (username, user_id))
+        # Проверяем, не занято ли имя другим пользователем
+        c.execute('SELECT user_id FROM user_names WHERE username = ? AND user_id != ?', (username, user_id))
         if c.fetchone():
-            c.close()
-            conn.close()
             return False, "Это имя уже занято другим пользователем"
         
+        # Обновляем или вставляем имя
         c.execute('''
-            INSERT INTO user_names (user_id, username, updated_at) 
-            VALUES (%s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (user_id) 
-            DO UPDATE SET username = %s, updated_at = CURRENT_TIMESTAMP
-        ''', (user_id, username, username))
-        conn.commit()
-        c.close()
-        conn.close()
+            INSERT OR REPLACE INTO user_names (user_id, username, updated_at) 
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        ''', (user_id, username))
+        db.commit()
         return True, "Имя успешно изменено"
     except Exception as e:
         logger.error(f"Ошибка при установке имени пользователя {user_id}: {e}")
+        db.rollback()
         return False, f"Ошибка: {str(e)}"
 
 # ==================== СИСТЕМА ЛИМИТОВ ====================
 def check_daily_topic_limit(user_id):
+    """Проверка дневного лимита создания тем"""
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
+        c = db.cursor()
         today = datetime.now().strftime('%Y-%m-%d')
         
-        c.execute('SELECT topics_created FROM daily_limits WHERE user_id = %s AND date = %s', (user_id, today))
+        # Получаем количество созданных тем сегодня
+        c.execute('''
+            SELECT topics_created FROM daily_limits 
+            WHERE user_id = ? AND date = ?
+        ''', (user_id, today))
+        
         result = c.fetchone()
-        c.close()
-        conn.close()
         
         if result:
             topics_today = result[0]
             remaining = max(0, DAILY_TOPIC_LIMIT - topics_today)
             return remaining, topics_today
         else:
+            # Если записи нет, значит 0 тем создано сегодня
             return DAILY_TOPIC_LIMIT, 0
+            
     except Exception as e:
         logger.error(f"Ошибка при проверке лимита тем пользователя {user_id}: {e}")
         return DAILY_TOPIC_LIMIT, 0
 
 def increment_daily_topic_count(user_id):
+    """Увеличение счетчика созданных тем за день"""
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
+        c = db.cursor()
         today = datetime.now().strftime('%Y-%m-%d')
         
+        # Увеличиваем счетчик или создаем новую запись
         c.execute('''
             INSERT INTO daily_limits (user_id, date, topics_created)
-            VALUES (%s, %s, 1)
-            ON CONFLICT (user_id, date) 
-            DO UPDATE SET topics_created = daily_limits.topics_created + 1
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id, date) 
+            DO UPDATE SET topics_created = topics_created + 1
         ''', (user_id, today))
-        conn.commit()
-        c.close()
-        conn.close()
+        
+        db.commit()
         return True
     except Exception as e:
         logger.error(f"Ошибка при увеличении счетчика тем пользователя {user_id}: {e}")
+        db.rollback()
         return False
 
 # ==================== ФУНКЦИЯ ПРОВЕРКИ БАНА ====================
 def check_user_ban(user_id):
+    """Проверка, забанен ли пользователь (возвращает информацию о бане или None)"""
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
+        c = db.cursor()
+        # Проверяем активный бан с неистекшим сроком
         c.execute('''
             SELECT id, reason, unbanned_at FROM bans 
-            WHERE user_id = %s 
-            AND is_active = TRUE 
-            AND unbanned_at > CURRENT_TIMESTAMP
+            WHERE user_id = ? 
+            AND is_active = 1 
+            AND datetime(unbanned_at) > datetime('now')
         ''', (user_id,))
-        result = c.fetchone()
-        c.close()
-        conn.close()
-        return result
+        
+        return c.fetchone()
     except Exception as e:
         logger.error(f"Ошибка при проверке бана пользователя {user_id}: {e}")
         return None
 
 def is_user_banned(user_id):
+    """Проверка, забанен ли пользователь (возвращает True/False)"""
     ban_info = check_user_ban(user_id)
     return ban_info is not None
 
-# ==================== ОСНОВНЫЕ ФУНКЦИИ БАЗЫ ДАННЫХ ====================
+# ==================== ОСНОВНЫЕ ФУНКЦИИ ====================
 def add_topic(text, user_id):
+    """Добавление новой темы с проверкой лимитов"""
+    c = db.cursor()
+    
+    # 1. ПРОВЕРЯЕМ БАН
     if is_user_banned(user_id):
         logger.error(f"🚨 ПОЛЬЗОВАТЕЛЬ {user_id} ЗАБАНЕН! Тема НЕ создана.")
         return None
     
+    # 2. Проверяем дневной лимит
     remaining, topics_today = check_daily_topic_limit(user_id)
     if remaining <= 0:
         logger.warning(f"Пользователь {user_id} достиг дневного лимита тем ({topics_today}/{DAILY_TOPIC_LIMIT})")
         return "limit_exceeded"
     
+    # 3. Создаем тему
     clean_text = ' '.join(text.strip().split())
     
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
+        c.execute('INSERT INTO topics (text, user_id) VALUES (?, ?)', (clean_text, user_id))
         
-        c.execute('INSERT INTO topics (text, user_id) VALUES (%s, %s) RETURNING id', (clean_text, user_id))
-        topic_id = c.fetchone()[0]
+        # 4. Получаем ID созданной темы
+        topic_id = c.lastrowid
         
+        # 5. Обновляем статистику
         c.execute('''
-            INSERT INTO user_stats (user_id, topics_created, replies_written, replies_received) 
-            VALUES (%s, 1, 0, 0)
-            ON CONFLICT (user_id) 
-            DO UPDATE SET topics_created = user_stats.topics_created + 1,
-                         last_active = CURRENT_TIMESTAMP
+            INSERT OR IGNORE INTO user_stats (user_id, topics_created, replies_written, replies_received) 
+            VALUES (?, 0, 0, 0)
         ''', (user_id,))
+        c.execute('UPDATE user_stats SET topics_created = topics_created + 1 WHERE user_id = ?', (user_id,))
+        c.execute('UPDATE user_stats SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
         
+        # 6. Увеличиваем счетчик дневного лимита
         increment_daily_topic_count(user_id)
         
-        conn.commit()
-        c.close()
-        conn.close()
+        db.commit()
         
-        logger.info(f"✅ Тема #{topic_id} создана пользователем {user_id}")
+        logger.info(f"✅ Тема #{topic_id} создана пользователем {user_id} ({topics_today+1}/{DAILY_TOPIC_LIMIT} сегодня)")
         return topic_id
         
     except Exception as e:
         logger.error(f"❌ Ошибка при создании темы пользователем {user_id}: {e}")
+        db.rollback()
         return None
 
 def add_reply(topic_id, text, user_id):
+    """Добавление ответа к теме с уведомлением автора"""
+    c = db.cursor()
+    
+    # 1. ПРОВЕРЯЕМ БАН
     if is_user_banned(user_id):
         logger.error(f"🚨 ПОЛЬЗОВАТЕЛЬ {user_id} ЗАБАНЕН! Ответ НЕ создан.")
         return None
@@ -539,16 +629,12 @@ def add_reply(topic_id, text, user_id):
     clean_text = ' '.join(text.strip().split())
     
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        
-        c.execute('SELECT user_id, is_active FROM topics WHERE id = %s', (topic_id,))
+        # 2. Проверяем существует ли тема
+        c.execute('SELECT user_id, is_active FROM topics WHERE id = ?', (topic_id,))
         topic = c.fetchone()
         
         if not topic:
             logger.error(f"❌ Тема #{topic_id} не найдена")
-            c.close()
-            conn.close()
             return None
         
         topic_author_id = topic[0]
@@ -556,319 +642,286 @@ def add_reply(topic_id, text, user_id):
         
         if not is_active:
             logger.error(f"❌ Тема #{topic_id} закрыта")
-            c.close()
-            conn.close()
             return "closed"
         
-        c.execute('INSERT INTO replies (topic_id, text, user_id) VALUES (%s, %s, %s) RETURNING id', 
+        # 3. Создаем ответ
+        c.execute('INSERT INTO replies (topic_id, text, user_id) VALUES (?, ?, ?)', 
                   (topic_id, clean_text, user_id))
-        reply_id = c.fetchone()[0]
+        c.execute('UPDATE topics SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', (topic_id,))
         
-        c.execute('UPDATE topics SET updated_at = CURRENT_TIMESTAMP WHERE id = %s', (topic_id,))
+        reply_id = c.lastrowid
         
+        # 4. Обновляем статистику
         c.execute('''
-            INSERT INTO user_stats (user_id, topics_created, replies_written, replies_received) 
-            VALUES (%s, 0, 1, 0)
-            ON CONFLICT (user_id) 
-            DO UPDATE SET replies_written = user_stats.replies_written + 1,
-                         last_active = CURRENT_TIMESTAMP
+            INSERT OR IGNORE INTO user_stats (user_id, topics_created, replies_written, replies_received) 
+            VALUES (?, 0, 0, 0)
         ''', (user_id,))
+        c.execute('UPDATE user_stats SET replies_written = replies_written + 1 WHERE user_id = ?', (user_id,))
+        c.execute('UPDATE user_stats SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
         
         c.execute('''
-            INSERT INTO user_stats (user_id, topics_created, replies_written, replies_received) 
-            VALUES (%s, 0, 0, 1)
-            ON CONFLICT (user_id) 
-            DO UPDATE SET replies_received = user_stats.replies_received + 1
+            INSERT OR IGNORE INTO user_stats (user_id, topics_created, replies_written, replies_received) 
+            VALUES (?, 0, 0, 0)
         ''', (topic_author_id,))
+        c.execute('UPDATE user_stats SET replies_received = replies_received + 1 WHERE user_id = ?', (topic_author_id,))
         
-        conn.commit()
-        c.close()
-        conn.close()
+        db.commit()
         
+        # 5. Отправляем уведомление (если не отвечает сам себе и у пользователя включены уведомления)
         if topic_author_id != user_id:
-            notifications_enabled = get_user_notification_setting(topic_author_id)
-            if notifications_enabled:
-                send_reply_notification(topic_author_id, topic_id, reply_id, clean_text)
+            send_reply_notification(topic_author_id, topic_id, reply_id, clean_text)
         
         logger.info(f"✅ Ответ #{reply_id} создан пользователем {user_id} к теме #{topic_id}")
         return reply_id
         
     except Exception as e:
         logger.error(f"❌ Ошибка при создании ответа пользователем {user_id}: {e}")
+        db.rollback()
         return None
 
 def get_topic(topic_id, user_id=None):
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Получение темы"""
+    c = db.cursor()
     if user_id:
-        c.execute('SELECT * FROM topics WHERE id = %s', (topic_id,))
+        c.execute('SELECT * FROM topics WHERE id = ?', (topic_id,))
     else:
-        c.execute('SELECT * FROM topics WHERE id = %s AND is_active = TRUE', (topic_id,))
-    result = c.fetchone()
-    c.close()
-    conn.close()
-    return result
+        c.execute('SELECT * FROM topics WHERE id = ? AND is_active = 1', (topic_id,))
+    return c.fetchone()
 
 def close_topic(topic_id, user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Закрытие темы"""
+    c = db.cursor()
     
-    c.execute('SELECT user_id FROM topics WHERE id = %s', (topic_id,))
+    # Проверяем, является ли пользователь автором
+    c.execute('SELECT user_id FROM topics WHERE id = ?', (topic_id,))
     topic = c.fetchone()
     
     if not topic:
-        c.close()
-        conn.close()
         return False, "Тема не найдена"
     
     if topic[0] != user_id:
-        c.close()
-        conn.close()
         return False, "Вы не автор этой темы"
     
-    c.execute('UPDATE topics SET is_active = FALSE WHERE id = %s', (topic_id,))
-    conn.commit()
-    c.close()
-    conn.close()
+    # Закрываем тему
+    c.execute('UPDATE topics SET is_active = 0 WHERE id = ?', (topic_id,))
+    db.commit()
     return True, "✅ Тема закрыта"
 
 def delete_topic(topic_id, user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Удаление темы со всеми ответами"""
+    c = db.cursor()
     
-    c.execute('SELECT user_id FROM topics WHERE id = %s', (topic_id,))
+    # Проверяем, является ли пользователь автором
+    c.execute('SELECT user_id FROM topics WHERE id = ?', (topic_id,))
     topic = c.fetchone()
     
     if not topic:
-        c.close()
-        conn.close()
         return False, "Тема не найдена"
     
     if topic[0] != user_id:
-        c.close()
-        conn.close()
         return False, "Вы не автор этой темы"
     
-    c.execute('DELETE FROM replies WHERE topic_id = %s', (topic_id,))
-    c.execute('DELETE FROM topics WHERE id = %s', (topic_id,))
+    # Удаляем все ответы темы
+    c.execute('DELETE FROM replies WHERE topic_id = ?', (topic_id,))
     
-    conn.commit()
-    c.close()
-    conn.close()
+    # Удаляем тему
+    c.execute('DELETE FROM topics WHERE id = ?', (topic_id,))
+    
+    db.commit()
     return True, "✅ Тема и все ответы удалены"
 
 def get_random_topic(exclude_user_id=None, viewed_topics=None):
-    conn = get_db_connection()
-    c = conn.cursor()
-    
-    query = 'SELECT * FROM topics WHERE is_active = TRUE'
-    params = []
-    
-    if exclude_user_id:
-        query += ' AND user_id != %s'
-        params.append(exclude_user_id)
+    """Получение случайной активной темы с исключением просмотренных"""
+    c = db.cursor()
     
     if viewed_topics and len(viewed_topics) > 0:
-        query += ' AND id NOT IN %s'
-        params.append(tuple(viewed_topics))
+        # Преобразуем список в строку для SQL запроса
+        viewed_str = ','.join(map(str, viewed_topics))
+        
+        if exclude_user_id:
+            c.execute(f'''
+                SELECT * FROM topics 
+                WHERE is_active = 1 
+                AND user_id != ? 
+                AND id NOT IN ({viewed_str})
+                ORDER BY RANDOM() 
+                LIMIT 1
+            ''', (exclude_user_id,))
+        else:
+            c.execute(f'''
+                SELECT * FROM topics 
+                WHERE is_active = 1 
+                AND id NOT IN ({viewed_str})
+                ORDER BY RANDOM() 
+                LIMIT 1
+            ''')
+    else:
+        if exclude_user_id:
+            c.execute('SELECT * FROM topics WHERE is_active = 1 AND user_id != ? ORDER BY RANDOM() LIMIT 1', 
+                     (exclude_user_id,))
+        else:
+            c.execute('SELECT * FROM topics WHERE is_active = 1 ORDER BY RANDOM() LIMIT 1')
     
-    query += ' ORDER BY RANDOM() LIMIT 1'
-    
-    c.execute(query, params)
-    result = c.fetchone()
-    c.close()
-    conn.close()
-    return result
+    return c.fetchone()
 
 def get_all_active_topics_count(exclude_user_id=None):
-    conn = get_db_connection()
-    c = conn.cursor()
-    
+    """Получение количества всех активных тем"""
+    c = db.cursor()
     if exclude_user_id:
-        c.execute('SELECT COUNT(*) FROM topics WHERE is_active = TRUE AND user_id != %s', (exclude_user_id,))
+        c.execute('SELECT COUNT(*) FROM topics WHERE is_active = 1 AND user_id != ?', (exclude_user_id,))
     else:
-        c.execute('SELECT COUNT(*) FROM topics WHERE is_active = TRUE')
-    
-    result = c.fetchone()[0] or 0
-    c.close()
-    conn.close()
-    return result
+        c.execute('SELECT COUNT(*) FROM topics WHERE is_active = 1')
+    return c.fetchone()[0]
 
 def get_user_topics(user_id, limit=10, offset=0):
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Получение тем пользователя"""
+    c = db.cursor()
     c.execute('''
         SELECT t.*, COUNT(r.id) as replies_count
         FROM topics t
-        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = TRUE
-        WHERE t.user_id = %s
+        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = 1
+        WHERE t.user_id = ?
         GROUP BY t.id
         ORDER BY t.updated_at DESC 
-        LIMIT %s OFFSET %s
+        LIMIT ? OFFSET ?
     ''', (user_id, limit, offset))
-    result = c.fetchall()
-    c.close()
-    conn.close()
-    return result
+    return c.fetchall()
 
 def get_topic_replies(topic_id, limit=5, offset=0):
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Получение ответов к теме"""
+    c = db.cursor()
     c.execute('''
         SELECT r.*
         FROM replies r
-        WHERE r.topic_id = %s AND r.is_active = TRUE
+        WHERE r.topic_id = ? AND r.is_active = 1
         ORDER BY r.created_at ASC
-        LIMIT %s OFFSET %s
+        LIMIT ? OFFSET ?
     ''', (topic_id, limit, offset))
-    result = c.fetchall()
-    c.close()
-    conn.close()
-    return result
+    return c.fetchall()
 
 def get_replies_count(topic_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM replies WHERE topic_id = %s AND is_active = TRUE', (topic_id,))
-    result = c.fetchone()[0] or 0
-    c.close()
-    conn.close()
-    return result
+    """Количество активных ответов"""
+    c = db.cursor()
+    c.execute('SELECT COUNT(*) FROM replies WHERE topic_id = ? AND is_active = 1', (topic_id,))
+    return c.fetchone()[0]
 
 def get_popular_topics(limit=5):
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Популярные темы"""
+    c = db.cursor()
     c.execute('''
         SELECT t.*, COUNT(r.id) as replies_count
         FROM topics t
-        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = TRUE
-        WHERE t.is_active = TRUE
+        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = 1
+        WHERE t.is_active = 1
         GROUP BY t.id
         ORDER BY replies_count DESC, t.updated_at DESC
-        LIMIT %s
+        LIMIT ?
     ''', (limit,))
-    result = c.fetchall()
-    c.close()
-    conn.close()
-    return result
+    return c.fetchall()
 
 def get_popular_topics_with_ownership(user_id, limit=5, offset=0):
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Популярные темы с пометкой принадлежности пользователю"""
+    c = db.cursor()
     c.execute('''
         SELECT t.*, COUNT(r.id) as replies_count,
-               CASE WHEN t.user_id = %s THEN 1 ELSE 0 END as is_owner
+               CASE WHEN t.user_id = ? THEN 1 ELSE 0 END as is_owner
         FROM topics t
-        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = TRUE
-        WHERE t.is_active = TRUE
+        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = 1
+        WHERE t.is_active = 1
         GROUP BY t.id
         ORDER BY replies_count DESC, t.updated_at DESC
-        LIMIT %s OFFSET %s
+        LIMIT ? OFFSET ?
     ''', (user_id, limit, offset))
-    result = c.fetchall()
-    c.close()
-    conn.close()
-    return result
+    return c.fetchall()
 
+# ==================== СИСТЕМА ЖАЛОБ ====================
 def add_report(topic_id, reporter_id, reason):
+    """Добавление жалобы"""
+    c = db.cursor()
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
         c.execute('''
             INSERT INTO reports (topic_id, reporter_id, reason, status) 
-            VALUES (%s, %s, %s, 'pending')
-            RETURNING id
+            VALUES (?, ?, ?, 'pending')
         ''', (topic_id, reporter_id, reason))
-        report_id = c.fetchone()[0]
-        conn.commit()
-        c.close()
-        conn.close()
-        return report_id
+        db.commit()
+        return c.lastrowid
     except Exception as e:
         logger.error(f"Ошибка при добавлении жалобы: {e}")
+        db.rollback()
         return None
 
 def get_report(report_id):
+    """Получение жалобы по ID"""
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
+        c = db.cursor()
         c.execute('''
             SELECT r.*, t.text as topic_text, t.user_id as topic_author_id
             FROM reports r
             LEFT JOIN topics t ON r.topic_id = t.id
-            WHERE r.id = %s
+            WHERE r.id = ?
         ''', (report_id,))
-        result = c.fetchone()
-        c.close()
-        conn.close()
-        return result
+        return c.fetchone()
     except Exception as e:
         logger.error(f"Ошибка при получении жалобы #{report_id}: {e}")
         return None
 
 def get_pending_reports(limit=10, offset=0):
+    """Получение ожидающих жалоб"""
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
+        c = db.cursor()
         c.execute('''
             SELECT r.*, t.text as topic_text, t.user_id as topic_author_id
             FROM reports r
             LEFT JOIN topics t ON r.topic_id = t.id
             WHERE r.status = 'pending'
             ORDER BY r.created_at ASC
-            LIMIT %s OFFSET %s
+            LIMIT ? OFFSET ?
         ''', (limit, offset))
-        result = c.fetchall()
-        c.close()
-        conn.close()
-        return result
+        return c.fetchall()
     except Exception as e:
         logger.error(f"Ошибка при получении списка жалоб: {e}")
         return []
 
 def ban_user(user_id, reason, admin_id, days=1):
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Бан пользователя на указанное количество дней"""
+    c = db.cursor()
     
     try:
-        c.execute('DELETE FROM bans WHERE user_id = %s', (user_id,))
+        # Удаляем старый бан если есть
+        c.execute('DELETE FROM bans WHERE user_id = ?', (user_id,))
         
+        # Добавляем новый бан
         unbanned_at = datetime.now() + timedelta(days=days)
         c.execute('''
             INSERT INTO bans (user_id, reason, admin_id, unbanned_at) 
-            VALUES (%s, %s, %s, %s)
-        ''', (user_id, reason, admin_id, unbanned_at))
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, reason, admin_id, unbanned_at.strftime('%Y-%m-%d %H:%M:%S')))
         
-        conn.commit()
+        db.commit()
+        
+        # Отправляем уведомление пользователю
         send_ban_notification(user_id, reason, days, unbanned_at.strftime('%d.%m.%Y %H:%M'))
         
         logger.info(f"Пользователь {user_id} забанен на {days} дней администратором {admin_id}")
-        c.close()
-        conn.close()
         return True
     except Exception as e:
         logger.error(f"Ошибка при бане пользователя {user_id}: {e}")
-        conn.rollback()
-        c.close()
-        conn.close()
+        db.rollback()
         return False
 
 def unban_user(user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('UPDATE bans SET is_active = FALSE WHERE user_id = %s', (user_id,))
-    conn.commit()
-    c.close()
-    conn.close()
+    """Разбан пользователя"""
+    c = db.cursor()
+    c.execute('UPDATE bans SET is_active = 0 WHERE user_id = ?', (user_id,))
+    db.commit()
     return True
 
+# ==================== СТАТИСТИКА И ТОПЫ ====================
 def get_user_statistics(user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT * FROM user_stats WHERE user_id = %s', (user_id,))
+    """Получение статистики пользователя"""
+    c = db.cursor()
+    c.execute('SELECT * FROM user_stats WHERE user_id = ?', (user_id,))
     stats = c.fetchone()
-    c.close()
-    conn.close()
     
     if not stats:
         return {'topics_created': 0, 'replies_written': 0, 'replies_received': 0}
@@ -880,10 +933,11 @@ def get_user_statistics(user_id):
     }
 
 def get_top_users(limit=10):
+    """Получение топ пользователей по сумме тем и ответов"""
+    c = db.cursor()
+    
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        
+        # Сначала получаем всех пользователей из статистики
         c.execute('''
             SELECT 
                 us.user_id,
@@ -895,16 +949,16 @@ def get_top_users(limit=10):
             LEFT JOIN user_names un ON us.user_id = un.user_id
             WHERE us.topics_created > 0 OR us.replies_written > 0
             ORDER BY total_activity DESC, us.replies_written DESC, us.topics_created DESC
-            LIMIT %s
+            LIMIT ?
         ''', (limit,))
         
         result = c.fetchall()
-        c.close()
-        conn.close()
         
         if not result or len(result) == 0:
-            conn = get_db_connection()
-            c = conn.cursor()
+            # Если нет пользователей в статистике, ищем в темах и ответах
+            logger.info("Нет пользователей в статистике, ищем в темах и ответах")
+            
+            # Пользователи из тем
             c.execute('''
                 SELECT DISTINCT 
                     t.user_id as user_id,
@@ -917,12 +971,10 @@ def get_top_users(limit=10):
                 WHERE t.user_id IS NOT NULL
                 GROUP BY t.user_id
                 ORDER BY topics_created DESC
-                LIMIT %s
+                LIMIT ?
             ''', (limit,))
             
             result = c.fetchall()
-            c.close()
-            conn.close()
         
         return result
         
@@ -931,8 +983,8 @@ def get_top_users(limit=10):
         return []
 
 def get_weekly_record():
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Получение рекорда недели (тема с максимальным количеством ответов за неделю)"""
+    c = db.cursor()
     c.execute('''
         SELECT 
             t.id as topic_id,
@@ -942,20 +994,17 @@ def get_weekly_record():
         FROM topics t
         LEFT JOIN replies r ON t.id = r.topic_id
         LEFT JOIN user_names un ON t.user_id = un.user_id
-        WHERE t.created_at > CURRENT_TIMESTAMP - INTERVAL '7 days'
-        AND t.is_active = TRUE
+        WHERE t.created_at > datetime('now', '-7 days')
+        AND t.is_active = 1
         GROUP BY t.id
         ORDER BY replies_count DESC
         LIMIT 1
     ''')
-    result = c.fetchone()
-    c.close()
-    conn.close()
-    return result
+    return c.fetchone()
 
 def get_replies_leader():
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Получение лидера по количеству написанных ответов"""
+    c = db.cursor()
     c.execute('''
         SELECT 
             us.user_id,
@@ -967,15 +1016,21 @@ def get_replies_leader():
         ORDER BY us.replies_written DESC
         LIMIT 1
     ''')
-    result = c.fetchone()
-    c.close()
-    conn.close()
-    return result
+    return c.fetchone()
 
 def get_top_statistics():
+    """Получение всей статистики для команды /top"""
+    
+    # Количество активных тем
     active_topics = get_all_active_topics_count()
+    
+    # Рекорд недели
     weekly_record = get_weekly_record()
+    
+    # Лидер по ответам
     replies_leader = get_replies_leader()
+    
+    # Топ 3 пользователя
     top_users = get_top_users(limit=3)
     
     return {
@@ -986,10 +1041,12 @@ def get_top_statistics():
     }
 
 def get_admin_statistics():
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Получение общей статистики для админа (исправленная версия)"""
+    c = db.cursor()
     
     try:
+        # 1. ОБЩАЯ СТАТИСТИКА ПОЛЬЗОВАТЕЛЕЙ - ИСПРАВЛЕННАЯ
+        # Теперь учитываем ВСЕХ пользователей, включая тех, кто только зашел
         c.execute('''
             SELECT COUNT(DISTINCT user_id) FROM (
                 SELECT user_id FROM topics
@@ -1003,15 +1060,18 @@ def get_admin_statistics():
         ''')
         total_users = c.fetchone()[0] or 0
         
+        # 2. АКТИВНЫЕ ПОЛЬЗОВАТЕЛИ за 24 часа - ТЕ, КТО ЧТО-ТО СДЕЛАЛ
         c.execute('''
             SELECT COUNT(DISTINCT user_id) FROM (
-                SELECT user_id FROM topics WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                SELECT user_id FROM topics WHERE created_at > datetime('now', '-24 hours')
                 UNION
-                SELECT user_id FROM replies WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                SELECT user_id FROM replies WHERE created_at > datetime('now', '-24 hours')
             )
         ''')
         active_24h = c.fetchone()[0] or 0
         
+        # 3. НОВЫЕ ПОЛЬЗОВАТЕЛИ за 24 часа - ИСПРАВЛЕННАЯ ЛОГИКА
+        # Пользователи, которые за последние 24 часа сделали ЛЮБОЕ действие впервые
         c.execute('''
             SELECT COUNT(DISTINCT user_id) FROM (
                 SELECT user_id, MIN(created_at) as first_action FROM (
@@ -1020,45 +1080,45 @@ def get_admin_statistics():
                     SELECT user_id, created_at FROM replies
                 ) 
                 GROUP BY user_id
-                HAVING first_action > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                HAVING first_action > datetime('now', '-24 hours')
             )
         ''')
         new_24h = c.fetchone()[0] or 0
         
+        # Альтернативный способ: пользователи, у которых есть запись в user_stats за последние 24 часа
         if new_24h == 0:
             c.execute('''
                 SELECT COUNT(DISTINCT user_id) FROM user_stats 
-                WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                WHERE last_active > datetime('now', '-24 hours')
                 AND user_id NOT IN (
                     SELECT DISTINCT user_id FROM topics 
-                    WHERE created_at <= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                    WHERE created_at <= datetime('now', '-24 hours')
                     UNION
                     SELECT DISTINCT user_id FROM replies 
-                    WHERE created_at <= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                    WHERE created_at <= datetime('now', '-24 hours')
                 )
             ''')
             new_24h = c.fetchone()[0] or 0
         
+        # 4. Статистика контента (без изменений)
         c.execute("SELECT COUNT(*) FROM topics")
         total_topics = c.fetchone()[0] or 0
         
-        c.execute("SELECT COUNT(*) FROM topics WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'")
+        c.execute("SELECT COUNT(*) FROM topics WHERE created_at > datetime('now', '-24 hours')")
         new_topics_24h = c.fetchone()[0] or 0
         
         c.execute("SELECT COUNT(*) FROM replies")
         total_replies = c.fetchone()[0] or 0
         
+        # 5. Статистика модерации (без изменений)
         c.execute("SELECT COUNT(*) FROM reports WHERE status = 'pending'")
         active_reports = c.fetchone()[0] or 0
         
-        c.execute("SELECT COUNT(*) FROM reports WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'")
+        c.execute("SELECT COUNT(*) FROM reports WHERE created_at > datetime('now', '-24 hours')")
         reports_24h = c.fetchone()[0] or 0
         
-        c.execute("SELECT COUNT(*) FROM bans WHERE banned_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'")
+        c.execute("SELECT COUNT(*) FROM bans WHERE banned_at > datetime('now', '-24 hours')")
         bans_24h = c.fetchone()[0] or 0
-        
-        c.close()
-        conn.close()
         
         return {
             'total_users': total_users,
@@ -1074,8 +1134,6 @@ def get_admin_statistics():
         
     except Exception as e:
         logger.error(f"Ошибка при получении статистики админа: {e}")
-        c.close()
-        conn.close()
         return {
             'total_users': 0,
             'active_24h': 0,
@@ -1089,31 +1147,28 @@ def get_admin_statistics():
         }
 
 def update_report_status(report_id, status, admin_id, action=None):
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Обновление статуса жалобы"""
+    c = db.cursor()
     
     try:
         c.execute('''
             UPDATE reports 
-            SET status = %s, admin_action = %s, admin_id = %s, resolved_at = CURRENT_TIMESTAMP 
-            WHERE id = %s
+            SET status = ?, admin_action = ?, admin_id = ?, resolved_at = CURRENT_TIMESTAMP 
+            WHERE id = ?
         ''', (status, action, admin_id, report_id))
         
-        conn.commit()
-        c.close()
-        conn.close()
+        db.commit()
         return True
     except Exception as e:
         logger.error(f"Ошибка при обновлении статуса жалобы #{report_id}: {e}")
-        conn.rollback()
-        c.close()
-        conn.close()
+        db.rollback()
         return False
 
 def cleanup_invalid_reports():
+    """Очистка невалидных жалоб"""
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
+        c = db.cursor()
+        # Удаляем жалобы на несуществующие темы
         c.execute('''
             DELETE FROM reports 
             WHERE id IN (
@@ -1126,59 +1181,61 @@ def cleanup_invalid_reports():
         deleted_count = c.rowcount
         if deleted_count > 0:
             logger.info(f"Удалено {deleted_count} невалидных жалоб")
-        conn.commit()
-        c.close()
-        conn.close()
+        db.commit()
     except Exception as e:
         logger.error(f"Ошибка при очистке жалоб: {e}")
 
 def delete_topic_admin(topic_id, admin_id, reason):
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Удаление темы администратором"""
+    c = db.cursor()
     
     try:
-        c.execute('SELECT user_id, text FROM topics WHERE id = %s', (topic_id,))
+        # Получаем информацию о теме перед удалением
+        c.execute('SELECT user_id, text FROM topics WHERE id = ?', (topic_id,))
         topic_info = c.fetchone()
         
         if not topic_info:
-            c.close()
-            conn.close()
             return False, "Тема не найдена"
         
         topic_author_id = topic_info[0]
         topic_text = topic_info[1]
         
-        c.execute('DELETE FROM replies WHERE topic_id = %s', (topic_id,))
-        c.execute('DELETE FROM topics WHERE id = %s', (topic_id,))
-        c.execute('DELETE FROM reports WHERE topic_id = %s', (topic_id,))
+        # Удаляем все ответы темы
+        c.execute('DELETE FROM replies WHERE topic_id = ?', (topic_id,))
         
-        conn.commit()
-        c.close()
-        conn.close()
+        # Удаляем тему
+        c.execute('DELETE FROM topics WHERE id = ?', (topic_id,))
         
+        # Удаляем все жалобы на эту тему
+        c.execute('DELETE FROM reports WHERE topic_id = ?', (topic_id,))
+        
+        db.commit()
+        
+        # Отправляем уведомление автору темы (если он не админ)
         if topic_author_id and topic_author_id != admin_id:
             send_topic_deleted_notification(topic_author_id, topic_id, reason)
         
+        # Логируем действие
         logger.info(f"Тема #{topic_id} удалена администратором {admin_id}. Причина: {reason}")
         
         return True, f"Тема #{topic_id} удалена"
         
     except Exception as e:
         logger.error(f"Ошибка при удалении темы #{topic_id}: {e}")
-        conn.rollback()
-        c.close()
-        conn.close()
+        db.rollback()
         return False, f"Ошибка при удалении: {str(e)}"
 
 # ==================== ФУНКЦИИ УВЕДОМЛЕНИЙ ПОЛЬЗОВАТЕЛЯМ ====================
 def send_safe_message(user_id, text):
+    """Безопасная отправка сообщения"""
     try:
+        # Очищаем HTML перед отправкой
         text = sanitize_html(text)
         bot.send_message(user_id, text, parse_mode='HTML')
         return True
     except telebot.apihelper.ApiTelegramException as e:
         if e.error_code == 403:
-            logger.warning(f"Пользователь {user_id} заблокировал бота")
+            logger.warning(f"Пользователь {user_id} заблокировал бота, уведомление не отправлено")
         else:
             logger.error(f"Ошибка при отправке сообщения: {e}")
         return False
@@ -1187,6 +1244,7 @@ def send_safe_message(user_id, text):
         return False
 
 def send_ban_notification(user_id, reason, days, until_date):
+    """Отправка уведомления о бане пользователю"""
     try:
         text = f"""🚫 <b>ВАШ АККАУНТ ОГРАНИЧЕН</b>
 
@@ -1205,6 +1263,7 @@ def send_ban_notification(user_id, reason, days, until_date):
         logger.error(f"Неожиданная ошибка при отправке уведомления об ограничении: {e}")
 
 def send_topic_deleted_notification(user_id, topic_id, reason):
+    """Отправка уведомления об удалении темы"""
     try:
         text = f"""🗑️ <b>ВАША ТЕМА УДАЛЕНА</b>
 
@@ -1232,16 +1291,21 @@ def send_topic_deleted_notification(user_id, topic_id, reason):
         logger.error(f"Неожиданная ошибка при отправке уведомления об удалении темы: {e}")
 
 def send_reply_notification(user_id, topic_id, reply_id, reply_text):
+    """Отправка уведомления о новом ответе"""
     try:
+        # Проверяем, не ограничен ли пользователь
         if is_user_banned(user_id):
             return
+        
+        # Проверяем, включены ли уведомления у пользователя
+        if not should_notify_user(user_id):
+            logger.info(f"Уведомления отключены у пользователя {user_id}, пропускаем отправку")
+            return
             
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('SELECT text FROM topics WHERE id = %s', (topic_id,))
+        # Получаем текст темы для уведомления
+        c = db.cursor()
+        c.execute('SELECT text FROM topics WHERE id = ?', (topic_id,))
         topic = c.fetchone()
-        c.close()
-        conn.close()
         
         if not topic:
             return
@@ -1265,6 +1329,7 @@ def send_reply_notification(user_id, topic_id, reply_id, reply_text):
             telebot.types.InlineKeyboardButton("📄 ПЕРЕЙТИ К ТЕМЕ", callback_data=f"view_topic_{topic_id}_1")
         )
         
+        # Попытка отправить фото
         try:
             photo_url = PHOTOS.get('notification', PHOTOS['start'])
             bot.send_photo(
@@ -1275,6 +1340,7 @@ def send_reply_notification(user_id, topic_id, reply_id, reply_text):
                 parse_mode='HTML'
             )
         except:
+            # Если не удалось отправить фото, отправляем текстовое сообщение
             bot.send_message(
                 user_id,
                 text,
@@ -1290,30 +1356,34 @@ def send_reply_notification(user_id, topic_id, reply_id, reply_text):
 # ==================== БОТ ====================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
 user_states = {}
-user_last_messages = {}
-user_viewed_topics = {}
+user_last_messages = {}  # Словарь для хранения ID последних сообщений пользователя
+user_viewed_topics = {}  # Словарь для хранения просмотренных тем пользователем
 
 def delete_previous_messages(chat_id, user_id):
+    """Удаление предыдущих сообщений бота для конкретного пользователя"""
     try:
         if user_id in user_last_messages:
             for msg_id in user_last_messages[user_id]:
                 try:
                     bot.delete_message(chat_id, msg_id)
                 except:
-                    pass
+                    pass  # Игнорируем ошибки удаления
             user_last_messages[user_id] = []
     except Exception as e:
         logger.error(f"Ошибка при удалении предыдущих сообщений: {e}")
 
 def add_message_to_delete(user_id, message_id):
+    """Добавление ID сообщения в список для удаления"""
     if user_id not in user_last_messages:
         user_last_messages[user_id] = []
     user_last_messages[user_id].append(message_id)
     
+    # Ограничиваем список последними 5 сообщениями
     if len(user_last_messages[user_id]) > 5:
         user_last_messages[user_id] = user_last_messages[user_id][-5:]
 
 def send_photo_message(chat_id, photo_type, text, reply_markup=None):
+    """Отправка сообщения с фото"""
     try:
         photo_url = PHOTOS.get(photo_type, PHOTOS['start'])
         msg = bot.send_photo(
@@ -1325,6 +1395,7 @@ def send_photo_message(chat_id, photo_type, text, reply_markup=None):
         )
         return msg.message_id
     except:
+        # Если ошибка при отправке фото, отправляем текстовое сообщение
         try:
             msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode='HTML')
             return msg.message_id
@@ -1333,6 +1404,7 @@ def send_photo_message(chat_id, photo_type, text, reply_markup=None):
             return None
 
 def send_message_with_delete(chat_id, user_id, photo_type, text, reply_markup=None):
+    """Отправка сообщения с автоматическим удалением предыдущих"""
     delete_previous_messages(chat_id, user_id)
     message_id = send_photo_message(chat_id, photo_type, text, reply_markup)
     if message_id:
@@ -1340,10 +1412,12 @@ def send_message_with_delete(chat_id, user_id, photo_type, text, reply_markup=No
     return message_id
 
 def reset_user_viewed_topics(user_id):
+    """Сброс списка просмотренных тем для пользователя"""
     if user_id in user_viewed_topics:
         user_viewed_topics[user_id] = []
 
 def add_viewed_topic(user_id, topic_id):
+    """Добавление темы в список просмотренных"""
     if user_id not in user_viewed_topics:
         user_viewed_topics[user_id] = []
     
@@ -1351,6 +1425,7 @@ def add_viewed_topic(user_id, topic_id):
         user_viewed_topics[user_id].append(topic_id)
 
 def check_all_topics_viewed(user_id, exclude_user_id=None):
+    """Проверка, просмотрены ли все темы"""
     if user_id not in user_viewed_topics:
         return False
     
@@ -1359,71 +1434,102 @@ def check_all_topics_viewed(user_id, exclude_user_id=None):
     
     return viewed_count >= total_count and total_count > 0
 
-# ==================== ОБРАБОТКА СООБЩЕНИЙ В ГРУППАХ ====================
-@bot.message_handler(func=lambda message: message.chat.type in ['group', 'supergroup'])
-def handle_group_messages(message):
-    """Обработка только команды /top в групповых чатах"""
-    if message.text and message.text.strip() == '/top':
-        user_id = message.from_user.id
-        
-        try:
-            stats = get_top_statistics()
-            
-            text = "<b>🏆 ТОП АРХИВА МЫСЛЕЙ</b>\n\n"
-            
-            top_users = stats['top_users']
-            medals = ["🥇", "🥈", "🥉"]
-            
-            if top_users and len(top_users) > 0:
-                for i, user in enumerate(top_users[:3]):
-                    try:
-                        user_id_db = user[0]
-                        username = user[1] if user[1] else f"аноним_{user_id_db % 10000:04d}"
-                        topics_created = user[2] if len(user) > 2 else 0
-                        replies_written = user[3] if len(user) > 3 else 0
-                        
-                        text += f"{medals[i]} <b>{username}</b>\n"
-                        text += f"• {topics_created} тем • {replies_written} ответов\n\n"
-                    except:
-                        continue
-            else:
-                text += "📭 Пока нет активных пользователей.\n\n"
-            
-            text += f"<b>📊 Всего активных тем:</b> {stats['active_topics']}\n\n"
-            text += "<i>Для полного функционала перейдите в личные сообщения с ботом</i>"
-            
-            bot.send_message(message.chat.id, text, parse_mode='HTML')
-            
-        except Exception as e:
-            logger.error(f"Ошибка при выполнении /top в группе: {e}")
-    
-    # Все остальные сообщения в группах игнорируем
-    return
-
-@bot.callback_query_handler(func=lambda call: call.message.chat.type in ['group', 'supergroup'])
-def ignore_group_callbacks(call):
-    logger.info(f"Игнорируем колбэк в групповом чате: {call.data}")
-    return
-
-# ==================== ЛИЧНЫЕ СООБЩЕНИЯ ====================
-@bot.message_handler(commands=['start'])
-def start_command(message):
-    """Обработка команды /start только в личных чатах"""
-    if message.chat.type != 'private':
-        return
-    
+# ==================== КОМАНДА /TOP ====================
+@bot.message_handler(commands=['top'])
+def top_command(message):
+    """Обработка команды /top - топ пользователей (работает везде)"""
     user_id = message.from_user.id
     chat_id = message.chat.id
     
+    # Получаем статистику
+    stats = get_top_statistics()
+    
+    text = """<b>🏆 ТОП АРХИВА</b>
+
+<b>Лучшие участники сообщества:</b>
+"""
+    
+    # Топ 3 пользователя
+    top_users = stats['top_users']
+    medals = ["🥇", "🥈", "🥉"]
+    
+    if top_users and len(top_users) > 0:
+        for i, user in enumerate(top_users[:3]):
+            try:
+                user_id_db = user[0]
+                username = user[1] if user[1] else f"аноним_{user_id_db % 10000:04d}"
+                topics_created = user[2] if len(user) > 2 else 0
+                replies_written = user[3] if len(user) > 3 else 0
+                
+                # Получаем ранг пользователя
+                user_stats = {
+                    'topics_created': topics_created,
+                    'replies_written': replies_written,
+                    'replies_received': 0
+                }
+                rank_id = get_user_rank_by_stats(user_stats)
+                rank_name = RANK_SYSTEM[rank_id]['name']
+                
+                text += f"\n{medals[i]} <b>{username}</b>"
+                text += f"\n• {topics_created} тем • {replies_written} ответов"
+                text += f"\n🏅 Ранг: {rank_name}\n"
+            except Exception as e:
+                logger.error(f"Ошибка при форматировании пользователя {user}: {e}")
+                continue
+    else:
+        text += "\n\n📭 Пока нет активных пользователей."
+    
+    # Общая статистика
+    text += f"\n<b>📊 Всего активных тем:</b> {stats['active_topics']}"
+    
+    # Рекорд недели
+    weekly_record = stats['weekly_record']
+    if weekly_record and len(weekly_record) >= 4:
+        topic_id = weekly_record[0]
+        replies_count = weekly_record[2]
+        author_name = weekly_record[3] if weekly_record[3] else "Аноним"
+        text += f"\n<b>🔥 Рекорд недели:</b> {replies_count} ответов на тему #{topic_id} ({author_name})"
+    
+    # Лидер по ответам
+    replies_leader = stats['replies_leader']
+    if replies_leader and len(replies_leader) >= 3:
+        leader_name = replies_leader[1] if replies_leader[1] else f"аноним_{replies_leader[0] % 10000:04d}"
+        leader_replies = replies_leader[2]
+        text += f"\n<b>👤 Рекорд по ответам:</b> {leader_name} ({leader_replies} ответов)"
+    
+    # В групповом чате отправляем обычное сообщение
+    if message.chat.type in ['group', 'supergroup', 'channel']:
+        bot.send_message(chat_id, text, parse_mode='HTML')
+    else:
+        # В личном чате используем систему удаления предыдущих сообщений
+        send_message_with_delete(chat_id, user_id, 'top', text)
+
+# ==================== ГЛАВНОЕ МЕНЮ ====================
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    """Обработка команды /start"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # ИГНОРИРУЕМ если это групповой чат
+    if message.chat.type in ['group', 'supergroup', 'channel']:
+        logger.info(f"Игнорируем /start в групповом чате {message.chat.type} от пользователя {user_id}")
+        return
+    
+    # Проверка на ограничение
     ban_info = check_user_ban(user_id)
     if ban_info:
         try:
+            # Получаем время разбана
             unbanned_at_str = ban_info[2]
             unbanned_at = datetime.strptime(unbanned_at_str, '%Y-%m-%d %H:%M:%S')
             now = datetime.now()
             
+            # Проверяем, истек ли срок ограничения
             if unbanned_at <= now:
+                # Если время истекло, разбаниваем пользователя
                 unban_user(user_id)
+                # Удаляем сообщение /start
                 try:
                     bot.delete_message(chat_id, message.message_id)
                 except:
@@ -1436,6 +1542,7 @@ def start_command(message):
                 show_main_menu(chat_id, user_id)
                 return
             else:
+                # Рассчитываем оставшееся время
                 time_left = unbanned_at - now
                 hours_left = int(time_left.total_seconds() // 3600)
                 minutes_left = int((time_left.total_seconds() % 3600) // 60)
@@ -1456,6 +1563,7 @@ def start_command(message):
         except Exception as e:
             logger.error(f"Ошибка при обработке ограничения пользователя {user_id}: {e}")
     
+    # Удаляем команду /start
     try:
         bot.delete_message(chat_id, message.message_id)
     except:
@@ -1464,29 +1572,38 @@ def start_command(message):
     if user_id in user_states:
         del user_states[user_id]
     
+    # Сбрасываем прогресс просмотра
     reset_user_viewed_topics(user_id)
     
-    conn = get_db_connection()
-    c = conn.cursor()
+    # Инициализируем статистику пользователя
+    c = db.cursor()
     c.execute('''
-        INSERT INTO user_stats (user_id, topics_created, replies_written, replies_received) 
-        VALUES (%s, 0, 0, 0)
-        ON CONFLICT (user_id) 
-        DO UPDATE SET last_active = CURRENT_TIMESTAMP
+    INSERT OR IGNORE INTO user_stats (user_id, topics_created, replies_written, replies_received) 
+    VALUES (?, 0, 0, 0)
     ''', (user_id,))
-    conn.commit()
-    c.close()
-    conn.close()
+    c.execute('UPDATE user_stats SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
     
+    # Инициализируем настройки уведомлений
+    c.execute('''
+    INSERT OR IGNORE INTO user_notifications (user_id, reply_notifications) 
+    VALUES (?, 1)
+    ''', (user_id,))
+    
+    db.commit()
+    
+    # Генерируем уникальное имя при первом входе (если его еще нет)
     get_username(user_id)
     
     show_main_menu(chat_id, user_id)
 
 def show_main_menu(chat_id, user_id):
+    """Показать главное меню"""
+    # Проверяем, ограничен ли пользователь
     if is_user_banned(user_id):
         show_main_menu_for_banned_user(chat_id, user_id)
         return
     
+    # Получаем имя пользователя для приветствия
     username = get_username(user_id)
     
     text = f"""<b>🗄️ АРХИВ МЫСЛЕЙ</b>
@@ -1511,20 +1628,24 @@ def show_main_menu(chat_id, user_id):
     
     markup = telebot.types.InlineKeyboardMarkup()
     
+    # 1 ряд: 1 кнопка (личный кабинет)
     markup.add(
         telebot.types.InlineKeyboardButton("👤 МОЙ ПРОФИЛЬ", callback_data="my_profile")
     )
     
+    # 2 ряд: 2 кнопки
     markup.add(
         telebot.types.InlineKeyboardButton("➕ НОВАЯ ТЕМА", callback_data="new_topic"),
         telebot.types.InlineKeyboardButton("🎲 СЛУЧАЙНАЯ", callback_data="random_topic")
     )
     
+    # 3 ряд: 2 кнопки
     markup.add(
         telebot.types.InlineKeyboardButton("📁 МОИ ТЕМЫ", callback_data="my_topics_1"),
         telebot.types.InlineKeyboardButton("🔥 ПОПУЛЯРНЫЕ", callback_data="popular_1")
     )
     
+    # 4 ряд: если админ - кнопка админ-панели
     if ADMIN_ID and user_id == ADMIN_ID:
         markup.add(
             telebot.types.InlineKeyboardButton("⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_panel")
@@ -1533,6 +1654,8 @@ def show_main_menu(chat_id, user_id):
     send_message_with_delete(chat_id, user_id, 'start', text, markup)
 
 def show_main_menu_for_banned_user(chat_id, user_id):
+    """Показать главное меню для ограниченного пользователя"""
+    # Получаем имя пользователя
     username = get_username(user_id)
     
     text = f"""<b>🚫 РЕЖИМ ТОЛЬКО ПРОСМОТР</b>
@@ -1556,114 +1679,45 @@ def show_main_menu_for_banned_user(chat_id, user_id):
     
     markup = telebot.types.InlineKeyboardMarkup()
     
+    # 1 ряд: 1 кнопка (личный кабинет)
     markup.add(
         telebot.types.InlineKeyboardButton("👤 МОЙ ПРОФИЛЬ", callback_data="my_profile")
     )
     
+    # 2 ряд: 2 кнопки
     markup.add(
         telebot.types.InlineKeyboardButton("🎲 СЛУЧАЙНАЯ", callback_data="random_topic"),
         telebot.types.InlineKeyboardButton("🔥 ПОПУЛЯРНЫЕ", callback_data="popular_1")
     )
     
+    # 3 ряд: 1 кнопка
     markup.add(
         telebot.types.InlineKeyboardButton("📁 МОИ ТЕМЫ", callback_data="my_topics_1")
     )
     
     send_message_with_delete(chat_id, user_id, 'start', text, markup)
 
-# ==================== КОМАНДА /TOP В ЛИЧНЫХ ЧАТАХ ====================
-@bot.message_handler(commands=['top'])
-def top_command(message):
-    """Обработка команды /top в личных и групповых чатах"""
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    
-    stats = get_top_statistics()
-    
-    text = """<b>🏆 ТОП АРХИВА</b>
-
-<b>Лучшие участники сообщества:</b>
-"""
-    
-    top_users = stats['top_users']
-    medals = ["🥇", "🥈", "🥉"]
-    
-    if top_users and len(top_users) > 0:
-        for i, user in enumerate(top_users[:3]):
-            try:
-                user_id_db = user[0]
-                username = user[1] if user[1] else f"аноним_{user_id_db % 10000:04d}"
-                topics_created = user[2] if len(user) > 2 else 0
-                replies_written = user[3] if len(user) > 3 else 0
-                
-                user_stats = {
-                    'topics_created': topics_created,
-                    'replies_written': replies_written,
-                    'replies_received': 0
-                }
-                rank_id = get_user_rank_by_stats(user_stats)
-                rank_name = RANK_SYSTEM[rank_id]['name']
-                
-                text += f"\n{medals[i]} <b>{username}</b>"
-                text += f"\n• {topics_created} тем • {replies_written} ответов"
-                text += f"\n🏅 Ранг: {rank_name}\n"
-            except Exception as e:
-                logger.error(f"Ошибка при форматировании пользователя {user}: {e}")
-                continue
-    else:
-        text += "\n\n📭 Пока нет активных пользователей."
-    
-    text += f"\n<b>📊 Всего активных тем:</b> {stats['active_topics']}"
-    
-    weekly_record = stats['weekly_record']
-    if weekly_record and len(weekly_record) >= 4:
-        topic_id = weekly_record[0]
-        replies_count = weekly_record[2]
-        author_name = weekly_record[3] if weekly_record[3] else "Аноним"
-        text += f"\n<b>🔥 Рекорд недели:</b> {replies_count} ответов на тему #{topic_id} ({author_name})"
-    
-    replies_leader = stats['replies_leader']
-    if replies_leader and len(replies_leader) >= 3:
-        leader_name = replies_leader[1] if replies_leader[1] else f"аноним_{replies_leader[0] % 10000:04d}"
-        leader_replies = replies_leader[2]
-        text += f"\n<b>👤 Рекорд по ответам:</b> {leader_name} ({leader_replies} ответов)"
-    
-    # В групповом чате
-    if message.chat.type in ['group', 'supergroup']:
-        try:
-            bot.delete_message(chat_id, message.message_id)
-        except:
-            pass
-        bot.send_message(chat_id, text, parse_mode='HTML')
-    else:
-        # В личном чате
-        try:
-            bot.delete_message(chat_id, message.message_id)
-        except:
-            pass
-        send_message_with_delete(chat_id, user_id, 'top', text)
-
 # ==================== ЛИЧНЫЙ КАБИНЕТ ====================
 @bot.callback_query_handler(func=lambda call: call.data == "my_profile")
 def my_profile_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Личный кабинет пользователя"""
     user_id = call.from_user.id
-    chat_id = call.message.chat.id
     
+    # Проверяем, ограничен ли пользователь
     is_banned = is_user_banned(user_id)
+    
+    # Получаем статистику, имя и ранг
     stats = get_user_statistics(user_id)
     rank_id = get_user_rank(user_id)
     rank_info = RANK_SYSTEM[rank_id]
     username = get_username(user_id)
     
+    # Получаем настройки уведомлений
+    notification_settings = get_user_notification_settings(user_id)
+    
+    # Получаем прогресс до следующего ранга
     progress_info = get_rank_progress(user_id)
     progress_bar = get_progress_bar(progress_info['progress'])
-    
-    notifications_enabled = get_user_notification_setting(user_id)
-    notification_status = "🔔 ВКЛ" if notifications_enabled else "🔕 ВЫКЛ"
     
     if is_banned:
         ban_info = check_user_ban(user_id)
@@ -1674,6 +1728,7 @@ def my_profile_callback(call):
                 time_left = unbanned_at - datetime.now()
                 hours_left = int(time_left.total_seconds() // 3600)
                 minutes_left = int((time_left.total_seconds() % 3600) // 60)
+                
                 status_text = f"🚫 <b>ОГРАНИЧЕН</b> (осталось: {hours_left}ч {minutes_left}м)"
             except:
                 status_text = "🚫 <b>ОГРАНИЧЕН</b>"
@@ -1682,14 +1737,18 @@ def my_profile_callback(call):
     else:
         status_text = "🟢 <b>АКТИВЕН</b>"
     
+    # Проверяем дневной лимит
     remaining, topics_today = check_daily_topic_limit(user_id)
+    
+    # Статус уведомлений
+    notifications_status = "🔔 ВКЛ" if notification_settings['reply_notifications'] else "🔕 ВЫКЛ"
     
     text = f"""<b>👤 МОЙ ПРОФИЛЬ</b>
 
 <b>📛 ИМЯ:</b> {username}
 <b>🏅 РАНГ:</b> {rank_info['name']}
 <b>📈 СТАТУС:</b> {status_text}
-<b>🔔 УВЕДОМЛЕНИЯ:</b> {notification_status}
+<b>🔔 УВЕДОМЛЕНИЯ:</b> {notifications_status}
 
 <b>📊 СТАТИСТИКА:</b>
 • Тем создано: {stats['topics_created']}
@@ -1699,11 +1758,13 @@ def my_profile_callback(call):
 <b>📅 ДНЕВНОЙ ЛИМИТ:</b>
 • Создано сегодня: {topics_today}/{DAILY_TOPIC_LIMIT} тем"""
 
+    # Добавляем прогресс до следующего ранга, если он есть
     if progress_info['next_rank']:
         next_rank_info = RANK_SYSTEM[progress_info['next_rank']]
         text += f"\n\n<b>📈 ПРОГРЕСС ДО {next_rank_info['name']}:</b>"
         text += f"\n{progress_bar} {progress_info['progress']}%"
         
+        # Показываем что нужно для следующего ранга
         rem = progress_info['remaining']
         if rem['topics'] > 0 or rem['replies'] > 0:
             text += "\n<b>Осталось:</b>"
@@ -1716,69 +1777,54 @@ def my_profile_callback(call):
     
     markup = telebot.types.InlineKeyboardMarkup(row_width=1)
     
-    notifications_btn_text = "🔕 ВЫКЛ УВЕДОМЛЕНИЯ" if notifications_enabled else "🔔 ВКЛ УВЕДОМЛЕНИЯ"
-    markup.add(
-        telebot.types.InlineKeyboardButton(notifications_btn_text, callback_data="toggle_notifications"),
-        telebot.types.InlineKeyboardButton("✏️ ИЗМЕНИТЬ ИМЯ", callback_data="change_username")
-    )
-    
-    if is_banned:
-        markup.add(telebot.types.InlineKeyboardButton("🔙 НАЗАД", callback_data="menu_banned"))
+    # Кнопка управления уведомлениями
+    if not is_banned:
+        notifications_btn_text = "🔕 ВЫКЛЮЧИТЬ УВЕДОМЛЕНИЯ" if notification_settings['reply_notifications'] else "🔔 ВКЛЮЧИТЬ УВЕДОМЛЕНИЯ"
+        markup.add(
+            telebot.types.InlineKeyboardButton("✏️ ИЗМЕНИТЬ ИМЯ", callback_data="change_username"),
+            telebot.types.InlineKeyboardButton(notifications_btn_text, callback_data="toggle_notifications"),
+            telebot.types.InlineKeyboardButton("🔙 НАЗАД", callback_data="menu")
+        )
     else:
-        markup.add(telebot.types.InlineKeyboardButton("🔙 НАЗАД", callback_data="menu"))
+        markup.add(
+            telebot.types.InlineKeyboardButton("✏️ ИЗМЕНИТЬ ИМЯ", callback_data="change_username"),
+            telebot.types.InlineKeyboardButton("🔙 НАЗАД", callback_data="menu_banned")
+        )
     
-    try:
-        bot.delete_message(chat_id, call.message.message_id)
-    except:
-        pass
-    
-    send_message_with_delete(chat_id, user_id, 'profile', text, markup)
+    send_message_with_delete(call.message.chat.id, user_id, 'profile', text, markup)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "toggle_notifications")
 def toggle_notifications_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
+    """Переключение уведомлений"""
+    user_id = call.from_user.id
+    
+    # Проверяем, не забанен ли пользователь
+    if is_user_banned(user_id):
+        bot.answer_callback_query(call.id, "🚫 У вас нет доступа к этой функции", show_alert=True)
         return
     
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
+    # Переключаем уведомления
+    success, new_setting = toggle_user_notifications(user_id)
     
-    new_setting = toggle_user_notifications(user_id)
-    status = "включены" if new_setting else "выключены"
-    
-    text = f"""✅ <b>НАСТРОЙКИ ИЗМЕНЕНЫ</b>
-
-Уведомления о новых ответах на ваши темы теперь <b>{status}</b>.
-
-<b>Что это значит:</b>
-• {"Вы будете получать уведомления при каждом новом ответе" if new_setting else "Вы НЕ будете получать уведомления о новых ответах"}
-• Настройка применяется моментально
-• Вы можете изменить её в любой момент
-
-<i>Уведомления помогают не пропустить интересные обсуждения!</i>"""
-    
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(
-        telebot.types.InlineKeyboardButton("👤 В ПРОФИЛЬ", callback_data="my_profile")
-    )
-    
-    try:
-        bot.delete_message(chat_id, call.message.message_id)
-    except:
-        pass
-    
-    send_message_with_delete(chat_id, user_id, 'profile', text, markup)
-    bot.answer_callback_query(call.id)
+    if success:
+        if new_setting:
+            status_text = "🔔 УВЕДОМЛЕНИЯ ВКЛЮЧЕНЫ"
+            message = "Теперь вы будете получать уведомления о новых ответах на ваши темы."
+        else:
+            status_text = "🔕 УВЕДОМЛЕНИЯ ОТКЛЮЧЕНЫ"
+            message = "Вы больше не будете получать уведомления о новых ответах на ваши темы."
+        
+        # Обновляем профиль
+        my_profile_callback(call)
+        bot.answer_callback_query(call.id, message, show_alert=True)
+    else:
+        bot.answer_callback_query(call.id, "❌ Ошибка при изменении настроек", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "change_username")
 def change_username_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Изменение имени пользователя"""
     user_id = call.from_user.id
-    chat_id = call.message.chat.id
     
     current_username = get_username(user_id)
     
@@ -1805,31 +1851,27 @@ def change_username_callback(call):
         telebot.types.InlineKeyboardButton("🔙 НАЗАД В ПРОФИЛЬ", callback_data="my_profile")
     )
     
-    try:
-        bot.delete_message(chat_id, call.message.message_id)
-    except:
-        pass
-    
-    send_message_with_delete(chat_id, user_id, 'profile', text, markup)
+    send_message_with_delete(call.message.chat.id, user_id, 'profile', text, markup)
     bot.answer_callback_query(call.id)
     
+    # Устанавливаем состояние для обработки ввода имени
     user_states[user_id] = {'state': 'change_username'}
 
 # ==================== ОБРАБОТКА ИМЕНИ ПОЛЬЗОВАТЕЛЯ ====================
 @bot.message_handler(func=lambda message: message.from_user.id in user_states and user_states[message.from_user.id]['state'] == 'change_username')
 def handle_username_input(message):
-    if message.chat.type != 'private':
-        return
-    
+    """Обработка ввода нового имени"""
     user_id = message.from_user.id
     chat_id = message.chat.id
     new_username = message.text.strip()
     
+    # Удаляем сообщение пользователя
     try:
         bot.delete_message(chat_id, message.message_id)
     except:
         pass
     
+    # Проверяем валидность имени
     is_valid, error_message = validate_username(new_username)
     
     if not is_valid:
@@ -1839,7 +1881,7 @@ def handle_username_input(message):
 
 <b>Требования:</b>
 • От 3 до 12 символов
-• Только буквы (русские/английские), цифры и нижнее подчеркивание
+• Только буквы (русские/английские), цифры и нижнее подчёркивание
 • Без пробелов и специальных символов
 
 <b>Пример:</b> user_123, Иван_2024, мыслитель
@@ -1854,6 +1896,7 @@ def handle_username_input(message):
         send_message_with_delete(chat_id, user_id, 'profile', text, markup)
         return
     
+    # Пытаемся установить имя
     success, result_message = set_username(user_id, new_username)
     
     if success:
@@ -1880,6 +1923,7 @@ def handle_username_input(message):
         telebot.types.InlineKeyboardButton("👤 В ПРОФИЛЬ", callback_data="my_profile")
     )
     
+    # Удаляем состояние
     if user_id in user_states:
         del user_states[user_id]
     
@@ -1888,17 +1932,15 @@ def handle_username_input(message):
 # ==================== АДМИН-ПАНЕЛЬ ====================
 @bot.callback_query_handler(func=lambda call: call.data == "admin_panel")
 def admin_panel_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Админ-панель"""
     user_id = call.from_user.id
-    chat_id = call.message.chat.id
     
+    # Проверяем права администратора
     if not ADMIN_ID or user_id != ADMIN_ID:
         bot.answer_callback_query(call.id, "❌ Доступ запрещен", show_alert=True)
         return
     
+    # Получаем статистику
     stats = get_admin_statistics()
     
     text = f"""<b>⚙️ АДМИН-ПАНЕЛЬ</b>
@@ -1925,23 +1967,15 @@ def admin_panel_callback(call):
     
     markup.add(telebot.types.InlineKeyboardButton("🔙 НАЗАД", callback_data="menu"))
     
-    try:
-        bot.delete_message(chat_id, call.message.message_id)
-    except:
-        pass
-    
-    send_message_with_delete(chat_id, user_id, 'admin', text, markup)
+    send_message_with_delete(call.message.chat.id, user_id, 'admin', text, markup)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_reports_"))
 def admin_reports_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Список жалоб для админа"""
     user_id = call.from_user.id
-    chat_id = call.message.chat.id
     
+    # Проверяем права администратора
     if not ADMIN_ID or user_id != ADMIN_ID:
         bot.answer_callback_query(call.id, "❌ Доступ запрещен", show_alert=True)
         return
@@ -1953,12 +1987,10 @@ def admin_reports_callback(call):
         
         reports = get_pending_reports(limit=per_page, offset=offset)
         
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM reports WHERE status = %s', ('pending',))
+        # Получаем общее количество pending жалоб
+        c = db.cursor()
+        c.execute('SELECT COUNT(*) FROM reports WHERE status = "pending"')
         total_reports = c.fetchone()[0] or 0
-        c.close()
-        conn.close()
         
         if not reports and page == 1:
             text = """<b>📋 ЖАЛОБЫ</b>
@@ -1971,12 +2003,7 @@ def admin_reports_callback(call):
                 telebot.types.InlineKeyboardButton("🔙 В АДМИН-ПАНЕЛЬ", callback_data="admin_panel")
             )
             
-            try:
-                bot.delete_message(chat_id, call.message.message_id)
-            except:
-                pass
-            
-            send_message_with_delete(chat_id, user_id, 'report', text, markup)
+            send_message_with_delete(call.message.chat.id, user_id, 'report', text, markup)
             bot.answer_callback_query(call.id)
             return
         
@@ -1996,6 +2023,7 @@ def admin_reports_callback(call):
                 reason = report[3]
                 created_at = report[6]
                 
+                # Вычисляем время назад
                 if created_at:
                     try:
                         report_time = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
@@ -2014,6 +2042,7 @@ def admin_reports_callback(call):
         
         markup = telebot.types.InlineKeyboardMarkup(row_width=3)
         
+        # Кнопки для жалоб
         for report in reports:
             if report and len(report) > 0:
                 report_id = report[0]
@@ -2023,6 +2052,7 @@ def admin_reports_callback(call):
                     telebot.types.InlineKeyboardButton(f"✅ #{report_id}", callback_data=f"resolve_report_{report_id}")
                 )
         
+        # Пагинация
         pagination_buttons = []
         
         if page > 1:
@@ -2046,301 +2076,25 @@ def admin_reports_callback(call):
             telebot.types.InlineKeyboardButton("🔙 В АДМИН-ПАНЕЛЬ", callback_data="admin_panel")
         )
         
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'report', text, markup)
+        send_message_with_delete(call.message.chat.id, user_id, 'report', text, markup)
         bot.answer_callback_query(call.id)
         
     except Exception as e:
         logger.error(f"Ошибка в admin_reports_callback: {e}", exc_info=True)
         bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("view_report_"))
-def view_report_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
-    user_id = call.from_user.id
-    
-    if not ADMIN_ID or user_id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Доступ запрещен", show_alert=True)
-        return
-    
-    try:
-        report_id = int(call.data.split("_")[2])
-        report = get_report(report_id)
-        
-        if not report:
-            bot.answer_callback_query(call.id, "❌ Жалоба не найдена", show_alert=True)
-            return
-        
-        chat_id = call.message.chat.id
-        
-        report_id = report[0]
-        topic_id = report[1]
-        reporter_id = report[2]
-        reason = report[3]
-        status = report[4]
-        created_at = report[6]
-        topic_text = report[8] if len(report) > 8 else "Не найдено"
-        topic_author_id = report[9] if len(report) > 9 else None
-        
-        topic_preview = topic_text[:200] + "..." if len(topic_text) > 200 else topic_text
-        
-        text = f"""<b>🔍 ПРОСМОТР ЖАЛОБЫ #{report_id}</b>
-
-<b>Тема:</b> #{topic_id}
-<b>Жалобщик:</b> {reporter_id}
-<b>Причина:</b> {reason}
-<b>Статус:</b> {status}
-<b>Дата:</b> {format_datetime(created_at) if created_at else "Неизвестно"}
-
-<b>Текст темы:</b>
-{html.escape(topic_preview)}
-
-<b>Действия:</b>"""
-        
-        markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            telebot.types.InlineKeyboardButton("✅ ПРИНЯТЬ", callback_data=f"resolve_report_{report_id}"),
-            telebot.types.InlineKeyboardButton("❌ ОТКЛОНИТЬ", callback_data=f"reject_report_{report_id}"),
-            telebot.types.InlineKeyboardButton("🚫 ЗАБАНИТЬ АВТОРА", callback_data=f"ban_author_{topic_author_id}_{report_id}" if topic_author_id else "ban_author_none"),
-            telebot.types.InlineKeyboardButton("🗑️ УДАЛИТЬ ТЕМУ", callback_data=f"delete_topic_admin_{topic_id}_{report_id}"),
-            telebot.types.InlineKeyboardButton("🔙 К СПИСКУ", callback_data="admin_reports_1")
-        )
-        
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'report', text, markup)
-        bot.answer_callback_query(call.id)
-        
-    except Exception as e:
-        logger.error(f"Ошибка в view_report_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("resolve_report_"))
-def resolve_report_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
-    user_id = call.from_user.id
-    
-    if not ADMIN_ID or user_id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Доступ запрещен", show_alert=True)
-        return
-    
-    try:
-        report_id = int(call.data.split("_")[2])
-        success = update_report_status(report_id, 'resolved', user_id, 'Жалоба принята')
-        
-        if success:
-            text = f"""✅ <b>ЖАЛОБА #{report_id} ПРИНЯТА</b>
-
-Жалоба отмечена как принятая.
-Модератор рассмотрел её и принял соответствующие меры.
-
-<b>Статус:</b> ✅ Решена
-<b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
-
-<i>Спасибо за вашу работу!</i>"""
-        else:
-            text = "❌ <b>ОШИБКА</b>\n\nНе удалось обновить статус жалобы."
-        
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(
-            telebot.types.InlineKeyboardButton("🔙 К СПИСКУ ЖАЛОБ", callback_data="admin_reports_1")
-        )
-        
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(call.message.chat.id, user_id, 'report', text, markup)
-        bot.answer_callback_query(call.id)
-        
-    except Exception as e:
-        logger.error(f"Ошибка в resolve_report_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("reject_report_"))
-def reject_report_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
-    user_id = call.from_user.id
-    
-    if not ADMIN_ID or user_id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Доступ запрещен", show_alert=True)
-        return
-    
-    try:
-        report_id = int(call.data.split("_")[2])
-        success = update_report_status(report_id, 'rejected', user_id, 'Жалоба отклонена')
-        
-        if success:
-            text = f"""❌ <b>ЖАЛОБА #{report_id} ОТКЛОНЕНА</b>
-
-Жалоба отклонена как необоснованная.
-Тема остаётся в архиве без изменений.
-
-<b>Статус:</b> ❌ Отклонена
-<b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
-
-<i>Ложные жалобы могут привести к ограничению аккаунта жалобщика.</i>"""
-        else:
-            text = "❌ <b>ОШИБКА</b>\n\nНе удалось обновить статус жалобы."
-        
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(
-            telebot.types.InlineKeyboardButton("🔙 К СПИСКУ ЖАЛОБ", callback_data="admin_reports_1")
-        )
-        
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(call.message.chat.id, user_id, 'report', text, markup)
-        bot.answer_callback_query(call.id)
-        
-    except Exception as e:
-        logger.error(f"Ошибка в reject_report_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("ban_author_"))
-def ban_author_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
-    user_id = call.from_user.id
-    
-    if not ADMIN_ID or user_id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Доступ запрещен", show_alert=True)
-        return
-    
-    try:
-        parts = call.data.split("_")
-        author_id = int(parts[2])
-        report_id = int(parts[3]) if len(parts) > 3 else None
-        
-        if author_id == 0 or author_id == 'none':
-            bot.answer_callback_query(call.id, "❌ Не удалось определить автора темы", show_alert=True)
-            return
-        
-        user_states[user_id] = {
-            'state': 'ban_user',
-            'user_id_to_ban': author_id,
-            'report_id': report_id
-        }
-        
-        text = f"""<b>🚫 БАН ПОЛЬЗОВАТЕЛЯ {author_id}</b>
-
-Вы собираетесь забанить пользователя.
-
-<b>Введите причину бана:</b>
-• Максимум 200 символов
-• Будет показана пользователю
-• Сохранится в истории
-
-<b>Или введите количество дней:</b>
-• 1-30 дней (например: 7)
-• По умолчанию: 1 день
-
-<i>Для отмены нажмите кнопку ниже</i>"""
-        
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(
-            telebot.types.InlineKeyboardButton("❌ ОТМЕНА", callback_data=f"view_report_{report_id}" if report_id else "admin_reports_1")
-        )
-        
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(call.message.chat.id, user_id, 'admin', text, markup)
-        bot.answer_callback_query(call.id)
-        
-    except Exception as e:
-        logger.error(f"Ошибка в ban_author_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("delete_topic_admin_"))
-def delete_topic_admin_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
-    user_id = call.from_user.id
-    
-    if not ADMIN_ID or user_id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Доступ запрещен", show_alert=True)
-        return
-    
-    try:
-        parts = call.data.split("_")
-        topic_id = int(parts[3])
-        report_id = int(parts[4]) if len(parts) > 4 else None
-        
-        user_states[user_id] = {
-            'state': 'delete_topic_admin',
-            'topic_id': topic_id,
-            'report_id': report_id
-        }
-        
-        text = f"""<b>🗑️ УДАЛЕНИЕ ТЕМЫ #{topic_id}</b>
-
-Вы собираетесь удалить тему администраторскими правами.
-
-<b>Введите причину удаления:</b>
-• Будет отправлена автору темы
-• Сохранится в истории действий
-• Максимум 200 символов
-
-<i>Тема и все ответы будут безвозвратно удалены!</i>"""
-        
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(
-            telebot.types.InlineKeyboardButton("❌ ОТМЕНА", callback_data=f"view_report_{report_id}" if report_id else "admin_reports_1")
-        )
-        
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(call.message.chat.id, user_id, 'admin', text, markup)
-        bot.answer_callback_query(call.id)
-        
-    except Exception as e:
-        logger.error(f"Ошибка в delete_topic_admin_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
-
 # ==================== НОВАЯ ТЕМА ====================
 @bot.callback_query_handler(func=lambda call: call.data == "new_topic")
 def new_topic_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Создание новой темы"""
     user_id = call.from_user.id
-    chat_id = call.message.chat.id
     
+    # Проверка на ограничение
     if is_user_banned(user_id):
         bot.answer_callback_query(call.id, "🚫 Вы не можете создавать темы во время ограничения", show_alert=True)
         return
     
+    # Проверяем дневной лимит
     remaining, topics_today = check_daily_topic_limit(user_id)
     
     if remaining <= 0:
@@ -2365,16 +2119,11 @@ def new_topic_callback(call):
             telebot.types.InlineKeyboardButton("🔙 В МЕНЮ", callback_data="menu")
         )
         
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'limit', text, markup)
+        send_message_with_delete(call.message.chat.id, user_id, 'limit', text, markup)
         bot.answer_callback_query(call.id)
         return
     
-    user_states[user_id] = {'state': 'new_topic'}
+    user_states[call.from_user.id] = {'state': 'new_topic'}
     
     text = f"""<b>✍️ СОЗДАНИЕ НОВОЙ ТЕМЫ</b>
 
@@ -2393,25 +2142,18 @@ def new_topic_callback(call):
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("🔙 В МЕНЮ", callback_data="menu"))
     
-    try:
-        bot.delete_message(chat_id, call.message.message_id)
-    except:
-        pass
-    
-    send_message_with_delete(chat_id, user_id, 'new_topic', text, markup)
+    send_message_with_delete(call.message.chat.id, call.from_user.id, 'new_topic', text, markup)
     bot.answer_callback_query(call.id)
 
 # ==================== СЛУЧАЙНАЯ ТЕМА ====================
 @bot.callback_query_handler(func=lambda call: call.data == "random_topic")
 def random_topic_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Случайная тема без повторений"""
     user_id = call.from_user.id
-    chat_id = call.message.chat.id
     
+    # Проверяем, просмотрены ли все темы
     if check_all_topics_viewed(user_id, user_id):
+        # Сбрасываем список просмотренных и показываем сообщение
         reset_user_viewed_topics(user_id)
         
         text = """🎉 <b>ВЫ ПРОСМОТРЕЛИ ВСЕ ТЕМЫ!</b>
@@ -2432,19 +2174,16 @@ def random_topic_callback(call):
             telebot.types.InlineKeyboardButton("🔙 В МЕНЮ", callback_data="menu")
         )
         
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'random', text, markup)
+        send_message_with_delete(call.message.chat.id, user_id, 'random', text, markup)
         bot.answer_callback_query(call.id)
         return
     
+    # Получаем случайную тему, исключая просмотренные
     viewed_list = user_viewed_topics.get(user_id, [])
     topic = get_random_topic(exclude_user_id=user_id, viewed_topics=viewed_list)
     
     if not topic:
+        # Если нет непросмотренных тем, сбрасываем список
         reset_user_viewed_topics(user_id)
         topic = get_random_topic(exclude_user_id=user_id)
         
@@ -2460,15 +2199,11 @@ def random_topic_callback(call):
                 telebot.types.InlineKeyboardButton("🔙 В МЕНУ", callback_data="menu")
             )
             
-            try:
-                bot.delete_message(chat_id, call.message.message_id)
-            except:
-                pass
-            
-            send_message_with_delete(chat_id, user_id, 'start', text, markup)
+            send_message_with_delete(call.message.chat.id, user_id, 'start', text, markup)
             bot.answer_callback_query(call.id)
             return
         
+        # Показываем сообщение о новом цикле
         text = """🔄 <b>НОВЫЙ ЦИКЛ ПРОСМОТРА</b>
 
 Вы начали новый цикл просмотра тем.
@@ -2483,22 +2218,20 @@ def random_topic_callback(call):
             telebot.types.InlineKeyboardButton("🔙 В МЕНЮ", callback_data="menu")
         )
         
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'random', text, markup)
+        send_message_with_delete(call.message.chat.id, user_id, 'random', text, markup)
         bot.answer_callback_query(call.id)
         return
     
     topic_id, topic_text, _, is_active, created_at, _ = topic
     replies_count = get_replies_count(topic_id)
     
+    # Добавляем тему в список просмотренных
     add_viewed_topic(user_id, topic_id)
     
+    # Получаем статистику
     total_topics = get_all_active_topics_count(user_id)
     viewed_count = len(user_viewed_topics.get(user_id, []))
+    remaining = max(0, total_topics - viewed_count)
     
     text = f"""<b>🎲 СЛУЧАЙНАЯ ТЕМА #{topic_id}</b>
 
@@ -2524,36 +2257,25 @@ def random_topic_callback(call):
         telebot.types.InlineKeyboardButton("🔙 В МЕНЮ", callback_data="menu")
     )
     
-    try:
-        bot.delete_message(chat_id, call.message.message_id)
-    except:
-        pass
-    
-    send_message_with_delete(chat_id, user_id, 'random', text, markup)
+    send_message_with_delete(call.message.chat.id, user_id, 'random', text, markup)
     bot.answer_callback_query(call.id)
 
-# ==================== МОИ ТЕМЫ ====================
+# ==================== МОИ ТЕМЫ (С ПАГИНАЦИЕЙ) ====================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("my_topics_"))
 def my_topics_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Мои темы с пагинацией"""
     try:
         user_id = call.from_user.id
-        chat_id = call.message.chat.id
         page = int(call.data.split("_")[2])
         per_page = 5
         offset = (page - 1) * per_page
         
         topics = get_user_topics(user_id, limit=per_page, offset=offset)
         
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM topics WHERE user_id = %s', (user_id,))
+        # Получаем общее количество
+        c = db.cursor()
+        c.execute('SELECT COUNT(*) FROM topics WHERE user_id = ?', (user_id,))
         total_topics = c.fetchone()[0] or 0
-        c.close()
-        conn.close()
         
         if not topics and page == 1:
             text = """<b>📭 НЕТ ВАШИХ ТЕМ</b>
@@ -2567,12 +2289,7 @@ def my_topics_callback(call):
                 telebot.types.InlineKeyboardButton("🔙 В МЕНЮ", callback_data="menu_banned" if is_user_banned(user_id) else "menu")
             )
             
-            try:
-                bot.delete_message(chat_id, call.message.message_id)
-            except:
-                pass
-            
-            send_message_with_delete(chat_id, user_id, 'my_topics', text, markup)
+            send_message_with_delete(call.message.chat.id, user_id, 'my_topics', text, markup)
             bot.answer_callback_query(call.id)
             return
         
@@ -2597,6 +2314,7 @@ def my_topics_callback(call):
         
         markup = telebot.types.InlineKeyboardMarkup(row_width=3)
         
+        # Кнопки для тем
         for topic in topics:
             topic_id = topic[0]
             replies_count = topic[6]
@@ -2607,6 +2325,7 @@ def my_topics_callback(call):
                 telebot.types.InlineKeyboardButton(btn_text, callback_data=f"view_topic_{topic_id}_1")
             )
         
+        # Пагинация
         pagination_buttons = []
         
         if page > 1:
@@ -2626,44 +2345,35 @@ def my_topics_callback(call):
         if pagination_buttons:
             markup.add(*pagination_buttons)
         
+        # Навигация
         markup.add(
             telebot.types.InlineKeyboardButton("🔙 В МЕНЮ", callback_data="menu_banned" if is_user_banned(user_id) else "menu")
         )
         
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'my_topics', text, markup)
+        send_message_with_delete(call.message.chat.id, user_id, 'my_topics', text, markup)
         bot.answer_callback_query(call.id)
         
     except Exception as e:
         logger.error(f"Ошибка в my_topics_callback: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
 
-# ==================== ПОПУЛЯРНЫЕ ТЕМЫ ====================
+# ==================== ПОПУЛЯРНЫЕ ТЕМЫ (С ПАГИНАЦИЕЙ) ====================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("popular_"))
 def popular_topics_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Популярные темы с пагинацией"""
     try:
         user_id = call.from_user.id
-        chat_id = call.message.chat.id
         page = int(call.data.split("_")[1])
         per_page = 5
         offset = (page - 1) * per_page
         
+        # Получаем популярные темы с информацией о принадлежности
         topics = get_popular_topics_with_ownership(user_id, limit=per_page, offset=offset)
         
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM topics WHERE is_active = TRUE')
+        # Получаем общее количество
+        c = db.cursor()
+        c.execute('SELECT COUNT(*) FROM topics WHERE is_active = 1')
         total_topics = c.fetchone()[0] or 0
-        c.close()
-        conn.close()
         
         if not topics and page == 1:
             text = """<b>📭 НЕТ ПОПУЛЯРНЫХ ТЕМ</b>
@@ -2678,12 +2388,7 @@ def popular_topics_callback(call):
                 telebot.types.InlineKeyboardButton("🔙 В МЕНЮ", callback_data="menu_banned" if is_user_banned(user_id) else "menu")
             )
             
-            try:
-                bot.delete_message(chat_id, call.message.message_id)
-            except:
-                pass
-            
-            send_message_with_delete(chat_id, user_id, 'popular', text, markup)
+            send_message_with_delete(call.message.chat.id, user_id, 'popular', text, markup)
             bot.answer_callback_query(call.id)
             return
         
@@ -2703,6 +2408,7 @@ def popular_topics_callback(call):
             preview = topic_text[:70] + "..." if len(topic_text) > 70 else topic_text
             status = "🟢" if is_active else "🔴"
             
+            # Добавляем пометку (Вы) для тем текущего пользователя
             author_mark = " 👤<b>(Вы)</b>" if is_owner == 1 else ""
             
             text += f"\n\n{status} <b>{offset + i}. #{topic_id}{author_mark}</b>"
@@ -2711,6 +2417,7 @@ def popular_topics_callback(call):
         
         markup = telebot.types.InlineKeyboardMarkup(row_width=3)
         
+        # Кнопки для тем
         for topic in topics:
             topic_id = topic[0]
             replies_count = topic[6]
@@ -2726,6 +2433,7 @@ def popular_topics_callback(call):
                 telebot.types.InlineKeyboardButton(btn_text, callback_data=f"view_topic_{topic_id}_1")
             )
         
+        # Пагинация
         pagination_buttons = []
         
         if page > 1:
@@ -2745,32 +2453,24 @@ def popular_topics_callback(call):
         if pagination_buttons:
             markup.add(*pagination_buttons)
         
+        # Навигация
         markup.add(
             telebot.types.InlineKeyboardButton("🔙 В МЕНЮ", callback_data="menu_banned" if is_user_banned(user_id) else "menu")
         )
         
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'popular', text, markup)
+        send_message_with_delete(call.message.chat.id, user_id, 'popular', text, markup)
         bot.answer_callback_query(call.id)
         
     except Exception as e:
         logger.error(f"Ошибка в popular_topics_callback: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
 
-# ==================== ПРОСМОТР ТЕМЫ ====================
+# ==================== ПРОСМОТР ТЕМЫ (С ПАГИНАЦИЕЙ ОТВЕТОВ) ====================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_topic_"))
 def view_topic_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Просмотр темы с пагинацией ответов"""
     try:
         user_id = call.from_user.id
-        chat_id = call.message.chat.id
         parts = call.data.split("_")
         topic_id = int(parts[2])
         reply_page = int(parts[3]) if len(parts) > 3 else 1
@@ -2779,11 +2479,12 @@ def view_topic_callback(call):
         
         if not topic:
             bot.answer_callback_query(call.id, "❌ Тема не найдена", show_alert=True)
-            show_main_menu(chat_id, user_id)
+            show_main_menu(call.message.chat.id, user_id)
             return
         
         topic_id, topic_text, topic_user_id, is_active, created_at, updated_at = topic
         
+        # Получаем ответы с пагинацией
         per_page = 3
         offset = (reply_page - 1) * per_page
         replies = get_topic_replies(topic_id, limit=per_page, offset=offset)
@@ -2820,6 +2521,7 @@ def view_topic_callback(call):
         
         markup = telebot.types.InlineKeyboardMarkup(row_width=3)
         
+        # Пагинация ответов (если есть ответы)
         if total_replies > per_page:
             pagination_row = []
             if reply_page > 1:
@@ -2839,12 +2541,15 @@ def view_topic_callback(call):
             if pagination_row:
                 markup.add(*pagination_row)
         
+        # Основные кнопки
         if is_active and not is_banned:
             markup.add(telebot.types.InlineKeyboardButton("💬 ОТВЕТИТЬ", callback_data=f"reply_topic_{topic_id}"))
         
+        # Кнопка жалобы (только не автору и не ограниченному)
         if not is_author and not is_banned:
             markup.add(telebot.types.InlineKeyboardButton("⚠️ ПОЖАЛОВАТЬСЯ", callback_data=f"report_topic_{topic_id}"))
         
+        # Кнопки управления (только для автора и не ограниченного)
         if is_author and not is_banned:
             if is_active:
                 markup.add(
@@ -2856,16 +2561,12 @@ def view_topic_callback(call):
                     telebot.types.InlineKeyboardButton("🗑️ УДАЛИТЬ", callback_data=f"delete_topic_{topic_id}")
                 )
         
+        # Навигация
         markup.add(
             telebot.types.InlineKeyboardButton("🔙 В МЕНЮ", callback_data="menu_banned" if is_banned else "menu")
         )
         
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'view_topic', text, markup)
+        send_message_with_delete(call.message.chat.id, user_id, 'view_topic', text, markup)
         bot.answer_callback_query(call.id)
         
     except Exception as e:
@@ -2875,13 +2576,10 @@ def view_topic_callback(call):
 # ==================== СИСТЕМА ЖАЛОБ ====================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("report_topic_"))
 def report_topic_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Подача жалобы на тему"""
     user_id = call.from_user.id
-    chat_id = call.message.chat.id
     
+    # Проверка на ограничение
     if is_user_banned(user_id):
         bot.answer_callback_query(call.id, "🚫 Вы не можете подавать жалобы во время ограничения", show_alert=True)
         return
@@ -2889,12 +2587,10 @@ def report_topic_callback(call):
     try:
         topic_id = int(call.data.split("_")[2])
         
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('SELECT id FROM reports WHERE topic_id = %s AND reporter_id = %s AND status = %s', (topic_id, user_id, 'pending'))
+        # Проверяем, не подавал ли пользователь уже жалобу на эту тему
+        c = db.cursor()
+        c.execute('SELECT id FROM reports WHERE topic_id = ? AND reporter_id = ? AND status = "pending"', (topic_id, user_id))
         existing_report = c.fetchone()
-        c.close()
-        conn.close()
         
         if existing_report:
             bot.answer_callback_query(call.id, "⚠️ Вы уже жаловались на эту тему", show_alert=True)
@@ -2927,12 +2623,7 @@ def report_topic_callback(call):
             telebot.types.InlineKeyboardButton("🔙 НАЗАД", callback_data=f"view_topic_{topic_id}_1")
         )
         
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'report', text, markup)
+        send_message_with_delete(call.message.chat.id, user_id, 'report', text, markup)
         bot.answer_callback_query(call.id)
         
     except Exception as e:
@@ -2941,13 +2632,10 @@ def report_topic_callback(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("report_reason_"))
 def report_reason_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Обработка выбора причины жалобы"""
     user_id = call.from_user.id
-    chat_id = call.message.chat.id
     
+    # Проверка на ограничение
     if is_user_banned(user_id):
         bot.answer_callback_query(call.id, "🚫 Вы не можете подавать жалобы во время ограничения", show_alert=True)
         return
@@ -2957,6 +2645,7 @@ def report_reason_callback(call):
         topic_id = int(parts[2])
         reason = parts[3]
         
+        # Добавляем жалобу в базу
         report_id = add_report(topic_id, user_id, reason)
         
         if report_id:
@@ -2981,12 +2670,7 @@ def report_reason_callback(call):
             telebot.types.InlineKeyboardButton("🏠 В МЕНЮ", callback_data="menu")
         )
         
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'report', text, markup)
+        send_message_with_delete(call.message.chat.id, user_id, 'report', text, markup)
         bot.answer_callback_query(call.id)
         
     except Exception as e:
@@ -2996,13 +2680,10 @@ def report_reason_callback(call):
 # ==================== ОТВЕТ НА ТЕМУ ====================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reply_topic_"))
 def reply_topic_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
+    """Ответ на тему"""
     user_id = call.from_user.id
-    chat_id = call.message.chat.id
     
+    # Проверка на ограничение
     if is_user_banned(user_id):
         bot.answer_callback_query(call.id, "🚫 Вы не можете отвечать на темы во время ограничения", show_alert=True)
         return
@@ -3010,12 +2691,13 @@ def reply_topic_callback(call):
     try:
         topic_id = int(call.data.split("_")[2])
         
+        # Проверяем, активна ли тема
         topic = get_topic(topic_id)
-        if not topic or not topic[3]:
+        if not topic or not topic[3]:  # is_active
             bot.answer_callback_query(call.id, "❌ Тема закрыта", show_alert=True)
             return
         
-        user_states[user_id] = {'state': 'reply_topic', 'topic_id': topic_id}
+        user_states[call.from_user.id] = {'state': 'reply_topic', 'topic_id': topic_id}
         
         topic_text = topic[1]
         preview = topic_text[:100] + "..." if len(topic_text) > 100 else topic_text
@@ -3034,214 +2716,34 @@ def reply_topic_callback(call):
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(telebot.types.InlineKeyboardButton("🔙 НАЗАД", callback_data=f"view_topic_{topic_id}_1"))
         
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'new_topic', text, markup)
+        send_message_with_delete(call.message.chat.id, call.from_user.id, 'new_topic', text, markup)
         bot.answer_callback_query(call.id)
         
     except Exception as e:
         logger.error(f"Ошибка в reply_topic_callback: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
 
-# ==================== ЗАКРЫТИЕ ТЕМЫ ====================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("close_topic_"))
-def close_topic_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
-    
-    if is_user_banned(user_id):
-        bot.answer_callback_query(call.id, "🚫 Вы не можете закрывать темы во время ограничения", show_alert=True)
-        return
-    
-    try:
-        topic_id = int(call.data.split("_")[2])
-        
-        success, message = close_topic(topic_id, user_id)
-        
-        text = f"""{"✅" if success else "❌"} <b>{message}</b>
-
-Тема #{topic_id} {"закрыта для новых ответов." if success else "не закрыта."}
-
-<i>{"Вы можете удалить тему полностью или оставить её в архиве для чтения." if success else ""}</i>"""
-        
-        markup = telebot.types.InlineKeyboardMarkup()
-        if success:
-            markup.add(
-                telebot.types.InlineKeyboardButton("🗑️ УДАЛИТЬ ТЕМУ", callback_data=f"delete_topic_{topic_id}"),
-                telebot.types.InlineKeyboardButton("📄 К ТЕМЕ", callback_data=f"view_topic_{topic_id}_1"),
-                telebot.types.InlineKeyboardButton("🏠 В МЕНЮ", callback_data="menu")
-            )
-        else:
-            markup.add(
-                telebot.types.InlineKeyboardButton("📄 К ТЕМЕ", callback_data=f"view_topic_{topic_id}_1"),
-                telebot.types.InlineKeyboardButton("🏠 В МЕНЮ", callback_data="menu")
-            )
-        
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'view_topic', text, markup)
-        bot.answer_callback_query(call.id)
-        
-    except Exception as e:
-        logger.error(f"Ошибка в close_topic_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
-
-# ==================== УДАЛЕНИЕ ТЕМЫ ====================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("delete_topic_"))
-def delete_topic_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
-    
-    if is_user_banned(user_id):
-        bot.answer_callback_query(call.id, "🚫 Вы не можете удалять темы во время ограничения", show_alert=True)
-        return
-    
-    try:
-        topic_id = int(call.data.split("_")[2])
-        
-        text = f"""<b>🗑️ ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ</b>
-
-Вы собираетесь удалить тему #{topic_id}.
-
-<b>⚠️ ВНИМАНИЕ:</b>
-• Тема будет удалена безвозвратно
-• Все ответы к теме также удалятся
-• Действие нельзя отменить
-
-<b>Вы уверены, что хотите удалить тему?</b>"""
-        
-        markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            telebot.types.InlineKeyboardButton("✅ ДА, УДАЛИТЬ", callback_data=f"confirm_delete_{topic_id}"),
-            telebot.types.InlineKeyboardButton("❌ НЕТ, ОТМЕНА", callback_data=f"view_topic_{topic_id}_1")
-        )
-        
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'view_topic', text, markup)
-        bot.answer_callback_query(call.id)
-        
-    except Exception as e:
-        logger.error(f"Ошибка в delete_topic_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_delete_"))
-def confirm_delete_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
-    
-    if is_user_banned(user_id):
-        bot.answer_callback_query(call.id, "🚫 Вы не можете удалять темы во время ограничения", show_alert=True)
-        return
-    
-    try:
-        topic_id = int(call.data.split("_")[2])
-        
-        success, message = delete_topic(topic_id, user_id)
-        
-        text = f"""{"✅" if success else "❌"} <b>{message}</b>
-
-Тема #{topic_id} и все ответы к ней {"удалены из архива." if success else "не удалены."}
-
-<i>{"Вы можете создать новую тему или просмотреть другие обсуждения." if success else ""}</i>"""
-        
-        markup = telebot.types.InlineKeyboardMarkup()
-        if success:
-            markup.add(
-                telebot.types.InlineKeyboardButton("➕ НОВАЯ ТЕМА", callback_data="new_topic"),
-                telebot.types.InlineKeyboardButton("🎲 СЛУЧАЙНАЯ", callback_data="random_topic"),
-                telebot.types.InlineKeyboardButton("🏠 В МЕНЮ", callback_data="menu")
-            )
-        else:
-            markup.add(
-                telebot.types.InlineKeyboardButton("🏠 В МЕНЮ", callback_data="menu")
-            )
-        
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except:
-            pass
-        
-        send_message_with_delete(chat_id, user_id, 'view_topic', text, markup)
-        bot.answer_callback_query(call.id)
-        
-    except Exception as e:
-        logger.error(f"Ошибка в confirm_delete_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
-
-# ==================== ВОЗВРАТ В МЕНЮ ====================
-@bot.callback_query_handler(func=lambda call: call.data == "menu")
-def menu_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
-    
-    try:
-        bot.delete_message(chat_id, call.message.message_id)
-    except:
-        pass
-    
-    show_main_menu(chat_id, user_id)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "menu_banned")
-def menu_banned_callback(call):
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "Эта функция доступна только в личных сообщениях", show_alert=True)
-        return
-    
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
-    
-    try:
-        bot.delete_message(chat_id, call.message.message_id)
-    except:
-        pass
-    
-    show_main_menu_for_banned_user(chat_id, user_id)
-    bot.answer_callback_query(call.id)
-
 # ==================== ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ====================
 @bot.message_handler(func=lambda message: True)
 def text_handler(message):
-    """Обработка текстовых сообщений только в личных чатах"""
-    if message.chat.type != 'private':
-        return
-    
+    """Обработка текстовых сообщений"""
     user_id = message.from_user.id
     chat_id = message.chat.id
     text = message.text.strip()
     
     logger.info(f"Получено сообщение от {user_id}: '{text[:50]}...'")
     
+    # Если команда /top - обработаем в отдельной функции
     if text.startswith('/top'):
         top_command(message)
         return
     
+    # ИГНОРИРУЕМ если это групповой чат (кроме команды /top)
+    if message.chat.type in ['group', 'supergroup', 'channel']:
+        logger.info(f"Игнорируем сообщение в групповом чате {message.chat.type}: '{text[:50]}...'")
+        return
+    
+    # Проверяем бан в начале
     if is_user_banned(user_id):
         logger.warning(f"Забаненный пользователь {user_id} пытается отправить сообщение")
         ban_info = check_user_ban(user_id)
@@ -3265,11 +2767,13 @@ def text_handler(message):
                 
                 bot.send_message(chat_id, response, parse_mode='HTML')
                 
+                # Удаляем сообщение пользователя
                 try:
                     bot.delete_message(chat_id, message.message_id)
                 except:
                     pass
                 
+                # Сбрасываем состояние
                 if user_id in user_states:
                     logger.info(f"Сбрасываем состояние для забаненного пользователя {user_id}")
                     del user_states[user_id]
@@ -3279,6 +2783,7 @@ def text_handler(message):
             except Exception as e:
                 logger.error(f"Ошибка при обработке бана: {e}")
     
+    # Удаляем сообщение
     try:
         bot.delete_message(chat_id, message.message_id)
     except:
@@ -3365,8 +2870,9 @@ def text_handler(message):
         logger.info(f"Попытка создания ответа пользователем {user_id}")
         topic_id = state['topic_id']
         
+        # Проверяем, активна ли тема
         topic = get_topic(topic_id)
-        if not topic or not topic[3]:
+        if not topic or not topic[3]:  # is_active
             msg = bot.send_message(chat_id, "❌ Тема закрыта, нельзя оставить ответ.")
             add_message_to_delete(user_id, msg.message_id)
             show_main_menu(chat_id, user_id)
@@ -3415,125 +2921,67 @@ def text_handler(message):
         del user_states[user_id]
     
     elif state['state'] == 'change_username':
+        # Этот случай обрабатывается в отдельной функции handle_username_input
         pass
-    
-    elif state['state'] == 'ban_user':
-        if not ADMIN_ID or user_id != ADMIN_ID:
-            del user_states[user_id]
-            show_main_menu(chat_id, user_id)
-            return
-        
-        user_id_to_ban = state['user_id_to_ban']
-        report_id = state.get('report_id')
-        
-        if text.isdigit() and 1 <= int(text) <= 30:
-            days = int(text)
-            reason = "Нарушение правил сообщества"
-        else:
-            days = 1
-            reason = text[:200]
-        
-        success = ban_user(user_id_to_ban, reason, user_id, days)
-        
-        if success:
-            if report_id:
-                update_report_status(report_id, 'resolved', user_id, f'Пользователь забанен на {days} дней')
-            
-            text_response = f"""✅ <b>ПОЛЬЗОВАТЕЛЬ ЗАБАНЕН</b>
-
-Пользователь {user_id_to_ban} забанен на {days} день(дней).
-
-<b>Причина:</b>
-{reason}
-
-<b>Администратор:</b> {user_id}
-<b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
-
-<i>Бан применен успешно.</i>"""
-        else:
-            text_response = "❌ <b>ОШИБКА</b>\n\nНе удалось забанить пользователя."
-        
-        markup = telebot.types.InlineKeyboardMarkup()
-        if report_id:
-            markup.add(
-                telebot.types.InlineKeyboardButton("🔙 К ЖАЛОБЕ", callback_data=f"view_report_{report_id}")
-            )
-        else:
-            markup.add(
-                telebot.types.InlineKeyboardButton("🔙 К СПИСКУ ЖАЛОБ", callback_data="admin_reports_1")
-            )
-        
-        send_message_with_delete(chat_id, user_id, 'admin', text_response, markup)
-        del user_states[user_id]
-    
-    elif state['state'] == 'delete_topic_admin':
-        if not ADMIN_ID or user_id != ADMIN_ID:
-            del user_states[user_id]
-            show_main_menu(chat_id, user_id)
-            return
-        
-        topic_id = state['topic_id']
-        report_id = state.get('report_id')
-        reason = text[:200]
-        
-        success, message = delete_topic_admin(topic_id, user_id, reason)
-        
-        if success:
-            if report_id:
-                update_report_status(report_id, 'resolved', user_id, f'Тема удалена: {reason}')
-            
-            text_response = f"""✅ <b>ТЕМА УДАЛЕНА</b>
-
-Тема #{topic_id} удалена администратором.
-
-<b>Причина удаления:</b>
-{reason}
-
-<b>Администратор:</b> {user_id}
-<b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
-
-<i>Тема и все ответы удалены безвозвратно.</i>"""
-        else:
-            text_response = f"❌ <b>ОШИБКА</b>\n\n{message}"
-        
-        markup = telebot.types.InlineKeyboardMarkup()
-        if report_id:
-            markup.add(
-                telebot.types.InlineKeyboardButton("🔙 К ЖАЛОБЕ", callback_data=f"view_report_{report_id}")
-            )
-        else:
-            markup.add(
-                telebot.types.InlineKeyboardButton("🔙 К СПИСКУ ЖАЛОБ", callback_data="admin_reports_1")
-            )
-        
-        send_message_with_delete(chat_id, user_id, 'admin', text_response, markup)
-        del user_states[user_id]
-    
     elif state['state'] == 'report_topic':
+        # Обработка текстовой жалобы (если пользователь ввел свой текст)
         pass
 
-# ==================== ЗАПУСК БОТА ====================
+# ==================== ВОЗВРАТ В МЕНЮ ====================
+@bot.callback_query_handler(func=lambda call: call.data == "menu")
+def menu_callback(call):
+    """Возврат в меню"""
+    user_id = call.from_user.id
+    show_main_menu(call.message.chat.id, user_id)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_banned")
+def menu_banned_callback(call):
+    """Возврат в меню для ограниченного пользователя"""
+    show_main_menu_for_banned_user(call.message.chat.id, call.from_user.id)
+    bot.answer_callback_query(call.id)
+
+# ==================== ЗАПУСК ДЛЯ RAILWAY ====================
 if __name__ == '__main__':
     logger.info("🗄️ Бот 'Архив мыслей' запущен...")
-    logger.info("🐘 Используется PostgreSQL")
-    logger.info("🔔 Система управления уведомлениями активирована")
-    logger.info("📌 В групповых чатах бот реагирует ТОЛЬКО на команду /top")
+    logger.info(f"📂 База данных: {DB_NAME}")
+    logger.info("✅ Все данные сохранены (темы, ответы, статусы)")
+    logger.info("👤 Система уникальных имен 'аноним_XXXX' активирована")
+    logger.info("🔔 Система уведомлений активирована")
+    logger.info("⚙️ Система управления уведомлениями добавлена")
+    logger.info("🧹 Функция удаления предыдущих сообщений активирована")
+    logger.info("🔄 Система уникального просмотра тем активирована")
+    logger.info("⚠️ Система жалоб и модерации активирована")
+    logger.info("👤 Система личных кабинетов активирована")
+    logger.info("✏️ Система имен пользователей активирована")
+    logger.info("🏆 Команда /top активирована (работает везде)")
+    logger.info(f"📊 Система статусов активирована ({len(RANK_SYSTEM)} рангов)")
+    logger.info(f"📅 Дневной лимит тем: {DAILY_TOPIC_LIMIT}")
+    logger.info("📌 В групповых чатах бот отвечает ТОЛЬКО на /top")
     logger.info("💬 В личных чатах работает полный функционал")
     
+    # Очищаем невалидные жалобы при запуске
     cleanup_invalid_reports()
     
     if ADMIN_ID:
         logger.info(f"⚙️ Администратор: {ADMIN_ID}")
+    else:
+        logger.warning("⚠️ ID администратора не установлен. Установите ADMIN_ID в настройках.")
     
+    # Для Railway: определяем порт из переменной окружения
     PORT = int(os.environ.get('PORT', 8080))
+    
+    # Удаляем вебхук перед настройкой
     bot.remove_webhook()
     
     try:
+        # Пытаемся использовать вебхук (для Railway)
         webhook_url = os.environ.get('WEBHOOK_URL')
         if webhook_url:
             logger.info(f"🚀 Используем вебхук на Railway: {webhook_url}")
             bot.set_webhook(url=f"{webhook_url}/{BOT_TOKEN}")
             
+            # Запускаем веб-сервер для обработки вебхуков
             from flask import Flask, request
             app = Flask(__name__)
             
@@ -3553,9 +3001,16 @@ if __name__ == '__main__':
             logger.info(f"🌐 Запускаем Flask сервер на порту {PORT}")
             app.run(host='0.0.0.0', port=PORT)
         else:
+            # Если нет WEBHOOK_URL, используем polling (для локальной разработки)
             logger.info("🔄 Используем polling режим")
             bot.remove_webhook()
-            bot.polling(none_stop=True, timeout=30, interval=2, skip_pending=True)
+            
+            bot.polling(
+                none_stop=True,
+                timeout=30,
+                interval=2,
+                skip_pending=True
+            )
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем")
     except Exception as e:
