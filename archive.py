@@ -1,5 +1,4 @@
 import telebot
-import psycopg2
 import random
 from datetime import datetime, timedelta
 import logging
@@ -12,8 +11,18 @@ import os
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 
+# Проверяем наличие psycopg2
+try:
+    import psycopg2
+    HAS_POSTGRES = True
+    print("✅ psycopg2 импортирован успешно")
+except ImportError:
+    HAS_POSTGRES = False
+    print("⚠️ psycopg2 не установлен, используем SQLite")
+    import sqlite3
+
 # PostgreSQL connection URL from Railway
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:vaUPCSdlOJSRxhdTLjwzreixKFTQCtDy@tramway.proxy.rlwy.net:38575/railway")
 
 # Лимиты
 DAILY_TOPIC_LIMIT = 5  # Максимум 5 тем в день на пользователя
