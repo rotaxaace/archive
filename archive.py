@@ -603,6 +603,7 @@ def delete_topic(topic_id, user_id):
     c = db.cursor()
     
     try:
+        # Получаем информацию о теме
         c.execute('SELECT user_id FROM topics WHERE id = ?', (topic_id,))
         topic = c.fetchone()
         
@@ -612,18 +613,28 @@ def delete_topic(topic_id, user_id):
         if topic[0] != user_id:
             return False, "Вы не автор этой темы"
         
+        # Получаем количество ответов перед удалением для логирования
+        c.execute('SELECT COUNT(*) FROM replies WHERE topic_id = ?', (topic_id,))
+        replies_count = c.fetchone()[0] or 0
+        
+        # Удаляем все ответы темы
         c.execute('DELETE FROM replies WHERE topic_id = ?', (topic_id,))
+        
+        # Удаляем тему
         c.execute('DELETE FROM topics WHERE id = ?', (topic_id,))
+        
+        # Удаляем все жалобы на эту тему
+        c.execute('DELETE FROM reports WHERE topic_id = ?', (topic_id,))
         
         db.commit()
         
-        logger.info(f"✅ Тема #{topic_id} удалена пользователем {user_id}")
+        logger.info(f"✅ Тема #{topic_id} удалена пользователем {user_id} (удалено ответов: {replies_count})")
         return True, "✅ Тема и все ответы удалены"
         
     except Exception as e:
         logger.error(f"Ошибка при удалении темы #{topic_id}: {e}")
         db.rollback()
-        return False, "Ошибка при удалении темы"
+        return False, f"Ошибка при удалении темы: {str(e)}"
 
 def get_random_topic(exclude_user_id=None, viewed_topics=None):
     """Получение случайной активной темы с исключением просмотренных"""
@@ -2350,30 +2361,32 @@ def view_topic_callback(call):
 
 # ==================== ЗАКРЫТИЕ ТЕМЫ ====================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("close_topic_"))
-def close_topic_callback(call):
-    """Закрытие темы"""
+def handle_close_topic(call):
+    """Обработка закрытия темы"""
     user_id = call.from_user.id
     topic_id = int(call.data.split("_")[2])
     
     try:
+        # Закрываем тему
         success, message = close_topic(topic_id, user_id)
         
         if success:
-            bot.answer_callback_query(call.id, "✅ Тема закрыта", show_alert=False)
+            # Уведомляем пользователя
+            bot.answer_callback_query(call.id, message, show_alert=False)
             
             # Обновляем просмотр темы
             view_topic_callback(call)
         else:
-            bot.answer_callback_query(call.id, f"❌ {message}", show_alert=True)
+            bot.answer_callback_query(call.id, message, show_alert=True)
             
     except Exception as e:
-        logger.error(f"Ошибка в close_topic_callback: {e}")
+        logger.error(f"Ошибка при закрытии темы #{topic_id}: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка при закрытии темы", show_alert=True)
 
 # ==================== УДАЛЕНИЕ ТЕМЫ ====================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_topic_"))
-def delete_topic_callback(call):
-    """Удаление темы"""
+def handle_delete_topic(call):
+    """Обработка удаления темы (показ подтверждения)"""
     user_id = call.from_user.id
     topic_id = int(call.data.split("_")[2])
     
@@ -2403,16 +2416,17 @@ def delete_topic_callback(call):
         bot.answer_callback_query(call.id)
         
     except Exception as e:
-        logger.error(f"Ошибка в delete_topic_callback: {e}")
+        logger.error(f"Ошибка при подтверждении удаления темы #{topic_id}: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_delete_"))
-def confirm_delete_callback(call):
-    """Подтверждение удаления темы"""
+def handle_confirm_delete(call):
+    """Подтверждение и выполнение удаления темы"""
     user_id = call.from_user.id
     topic_id = int(call.data.split("_")[2])
     
     try:
+        # Удаляем тему
         success, message = delete_topic(topic_id, user_id)
         
         if success:
@@ -2435,7 +2449,7 @@ def confirm_delete_callback(call):
             bot.answer_callback_query(call.id, f"❌ {message}", show_alert=True)
             
     except Exception as e:
-        logger.error(f"Ошибка в confirm_delete_callback: {e}")
+        logger.error(f"Ошибка при удалении темы #{topic_id}: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка при удалении темы", show_alert=True)
 
 # ==================== СИСТЕМА ЖАЛОБ ====================
