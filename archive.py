@@ -1,5 +1,4 @@
 import telebot
-import psycopg2
 import random
 from datetime import datetime, timedelta
 import logging
@@ -14,16 +13,21 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Определяем, использовать ли PostgreSQL (Railway) или SQLite
-USE_POSTGRESQL = bool(DATABASE_URL)
+if not DATABASE_URL:
+    logging.basicConfig(level=logging.ERROR)
+    logger = logging.getLogger(__name__)
+    logger.error("❌ DATABASE_URL не установлен!")
+    raise ValueError("Установите DATABASE_URL в Railway переменных окружения")
 
-if USE_POSTGRESQL:
-    DB_NAME = "postgres"
-    logger.info("🚀 Используем PostgreSQL (Railway)")
-else:
-    DB_NAME = "thoughts_archive.db"
-    logger.info("💾 Используем SQLite (локально)")
-
+# Пробуем импортировать PostgreSQL драйвер
+try:
+    import psycopg2
+    logger.info("✅ psycopg2 импортирован успешно")
+except ImportError as e:
+    logger.error(f"❌ Ошибка импорта psycopg2: {e}")
+    logger.error("Проверьте requirements.txt: psycopg2-binary==2.9.9")
+    raise
+    
 # Лимиты
 DAILY_TOPIC_LIMIT = 5
 
@@ -376,16 +380,15 @@ class Database:
                 except Exception as e:
                     logger.warning(f"⚠️ Ошибка создания индекса {index}: {e}")
             
-            self.conn.commit()
+            conn.commit()
             logger.info("✅ База данных инициализирована")
-            
+            return conn
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации БД: {e}")
-            self.conn.rollback()
             raise
 
 # Создаем глобальный объект базы данных
-db = Database()
+db = init_db()
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С БД ====================
 def execute_query(query, params=None, commit=False):
@@ -395,7 +398,7 @@ def execute_query(query, params=None, commit=False):
 def fetch_one(query, params=None):
     """Обертка для получения одной записи"""
     return db.fetch_one(query, params)
-
+    
 def fetch_all(query, params=None):
     """Обертка для получения всех записей"""
     return db.fetch_all(query, params)
