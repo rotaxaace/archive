@@ -11,7 +11,8 @@ import os
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-DB_NAME = "thoughts_archive.db"
+# Используем путь из переменной окружения
+DB_NAME = os.environ.get("DB_NAME")
 
 # Лимиты
 DAILY_TOPIC_LIMIT = 5
@@ -48,7 +49,14 @@ logger = logging.getLogger(__name__)
 # ==================== БАЗА ДАННЫХ ====================
 def init_db():
     """Инициализация новой базы данных"""
+    # Создаем директорию для базы данных если ее нет
+    db_dir = os.path.dirname(DB_NAME)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+        logger.info(f"Создана директория для базы: {db_dir}")
+    
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    # ... остальной код без изменений ...
     c = conn.cursor()
     
     # Таблица тем
