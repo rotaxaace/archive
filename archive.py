@@ -1,5 +1,5 @@
 import telebot
-import sqlite3
+import psycopg2
 import random
 from datetime import datetime, timedelta
 import logging
@@ -7,12 +7,22 @@ import time
 import html
 import re
 import os
+import sys
 
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-# Используем путь из переменной окружения
-DB_NAME = os.environ.get("DB_NAME")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Определяем, использовать ли PostgreSQL (Railway) или SQLite
+USE_POSTGRESQL = bool(DATABASE_URL)
+
+if USE_POSTGRESQL:
+    DB_NAME = "postgres"
+    logger.info("🚀 Используем PostgreSQL (Railway)")
+else:
+    DB_NAME = "thoughts_archive.db"
+    logger.info("💾 Используем SQLite (локально)")
 
 # Лимиты
 DAILY_TOPIC_LIMIT = 5
@@ -46,143 +56,365 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== БАЗА ДАННЫХ ====================
-def init_db():
-    """Инициализация новой базы данных"""
-    # Создаем директорию для базы данных если ее нет
-    db_dir = os.path.dirname(DB_NAME)
-    if db_dir and not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
-        logger.info(f"Создана директория для базы: {db_dir}")
+# ==================== УНИВЕРСАЛЬНАЯ СИСТЕМА БАЗЫ ДАННЫХ ====================
+class Database:
+    def __init__(self):
+        self.conn = None
+        self.connect()
     
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    # ... остальной код без изменений ...
-    c = conn.cursor()
+    def connect(self):
+        """Подключение к базе данных (PostgreSQL или SQLite)"""
+        try:
+            if USE_POSTGRESQL:
+                # PostgreSQL для Railway
+                self.conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+                logger.info("✅ Подключено к PostgreSQL на Railway")
+            else:
+                # SQLite для локальной разработки
+                import sqlite3
+                self.conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+                logger.info("✅ Подключено к SQLite локально")
+            
+            self.init_db()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка подключения к БД: {e}")
+            return False
     
-    # Таблица тем
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS topics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            is_active BOOLEAN DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    def reconnect(self):
+        """Переподключение к базе данных"""
+        try:
+            if self.conn:
+                self.conn.close()
+            return self.connect()
+        except Exception as e:
+            logger.error(f"❌ Ошибка переподключения: {e}")
+            return False
     
-    # Таблица ответов
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS replies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            topic_id INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            is_active BOOLEAN DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
-        )
-    ''')
+    def execute_query(self, query, params=None, commit=False):
+        """Универсальное выполнение запроса"""
+        try:
+            cursor = self.conn.cursor()
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            
+            if commit:
+                self.conn.commit()
+            
+            # Для PostgreSQL нужно закрывать курсор
+            if USE_POSTGRESQL:
+                cursor.close()
+            
+            return cursor
+        except (psycopg2.OperationalError, sqlite3.OperationalError) as e:
+            logger.warning(f"📡 Ошибка соединения: {e}, пытаемся переподключиться...")
+            if self.reconnect():
+                return self.execute_query(query, params, commit)
+            else:
+                raise
+        except Exception as e:
+            logger.error(f"❌ Ошибка выполнения запроса: {e}\nЗапрос: {query[:100]}...")
+            raise
     
-    # Таблица жалоб
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            topic_id INTEGER NOT NULL,
-            reporter_id INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            admin_action TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            resolved_at TIMESTAMP,
-            admin_id INTEGER,
-            FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
-        )
-    ''')
+    def fetch_one(self, query, params=None):
+        """Получение одной записи"""
+        cursor = self.execute_query(query, params)
+        result = cursor.fetchone()
+        
+        if USE_POSTGRESQL:
+            cursor.close()
+        
+        return result
     
-    # Таблица банов
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS bans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL UNIQUE,
-            reason TEXT NOT NULL,
-            admin_id INTEGER NOT NULL,
-            banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            unbanned_at TIMESTAMP,
-            is_active BOOLEAN DEFAULT 1
-        )
-    ''')
+    def fetch_all(self, query, params=None):
+        """Получение всех записей"""
+        cursor = self.execute_query(query, params)
+        result = cursor.fetchall()
+        
+        if USE_POSTGRESQL:
+            cursor.close()
+        
+        return result
     
-    # Таблица статистики пользователей
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_stats (
-            user_id INTEGER PRIMARY KEY,
-            topics_created INTEGER DEFAULT 0,
-            replies_written INTEGER DEFAULT 0,
-            replies_received INTEGER DEFAULT 0,
-            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    def commit(self):
+        """Подтверждение изменений"""
+        try:
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка commit: {e}")
+            return False
     
-    # Таблица никнеймов пользователей
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_names (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT NOT NULL UNIQUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    def rollback(self):
+        """Откат изменений"""
+        try:
+            self.conn.rollback()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка rollback: {e}")
+            return False
     
-    # Таблица для дневных лимитов
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS daily_limits (
-            user_id INTEGER NOT NULL,
-            date DATE NOT NULL,
-            topics_created INTEGER DEFAULT 0,
-            PRIMARY KEY (user_id, date)
-        )
-    ''')
+    def get_lastrowid(self, cursor):
+        """Получение ID последней вставленной записи"""
+        if USE_POSTGRESQL:
+            # Для PostgreSQL возвращаем из курсора
+            return cursor.fetchone()[0] if cursor else None
+        else:
+            # Для SQLite используем lastrowid
+            return cursor.lastrowid if cursor else None
     
-    # Таблица настройки уведомлений пользователей
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_notifications (
-            user_id INTEGER PRIMARY KEY,
-            reply_notifications BOOLEAN DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Индексы для оптимизации
-    c.execute('CREATE INDEX IF NOT EXISTS idx_topics_user_id ON topics(user_id)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_topics_active ON topics(is_active)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_replies_topic_id ON replies(topic_id)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_replies_user_id ON replies(user_id)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_bans_active ON bans(is_active)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_bans_unbanned ON bans(unbanned_at)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_user_names_username ON user_names(username)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_daily_limits_date ON daily_limits(date)')
-    
-    conn.commit()
-    return conn
+    def init_db(self):
+        """Инициализация базы данных"""
+        try:
+            cursor = self.conn.cursor()
+            
+            if USE_POSTGRESQL:
+                # PostgreSQL схемы
+                # Таблица тем
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS topics (
+                        id SERIAL PRIMARY KEY,
+                        text TEXT NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Таблица ответов
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS replies (
+                        id SERIAL PRIMARY KEY,
+                        topic_id INTEGER NOT NULL,
+                        text TEXT NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        CONSTRAINT fk_topic FOREIGN KEY (topic_id) 
+                            REFERENCES topics(id) ON DELETE CASCADE
+                    )
+                ''')
+                
+                # Таблица жалоб
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS reports (
+                        id SERIAL PRIMARY KEY,
+                        topic_id INTEGER NOT NULL,
+                        reporter_id INTEGER NOT NULL,
+                        reason TEXT NOT NULL,
+                        status TEXT DEFAULT 'pending',
+                        admin_action TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        resolved_at TIMESTAMP,
+                        admin_id INTEGER,
+                        CONSTRAINT fk_topic_report FOREIGN KEY (topic_id) 
+                            REFERENCES topics(id) ON DELETE CASCADE
+                    )
+                ''')
+                
+                # Таблица банов
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS bans (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL UNIQUE,
+                        reason TEXT NOT NULL,
+                        admin_id INTEGER NOT NULL,
+                        banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        unbanned_at TIMESTAMP,
+                        is_active BOOLEAN DEFAULT TRUE
+                    )
+                ''')
+                
+                # Таблица статистики пользователей
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_stats (
+                        user_id INTEGER PRIMARY KEY,
+                        topics_created INTEGER DEFAULT 0,
+                        replies_written INTEGER DEFAULT 0,
+                        replies_received INTEGER DEFAULT 0,
+                        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Таблица никнеймов пользователей
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_names (
+                        user_id INTEGER PRIMARY KEY,
+                        username TEXT NOT NULL UNIQUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Таблица для дневных лимитов
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS daily_limits (
+                        user_id INTEGER NOT NULL,
+                        date DATE NOT NULL,
+                        topics_created INTEGER DEFAULT 0,
+                        PRIMARY KEY (user_id, date)
+                    )
+                ''')
+                
+                # Таблица настройки уведомлений пользователей
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_notifications (
+                        user_id INTEGER PRIMARY KEY,
+                        reply_notifications BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+            else:
+                # SQLite схемы (оригинальные)
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS topics (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        text TEXT NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        is_active BOOLEAN DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS replies (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        topic_id INTEGER NOT NULL,
+                        text TEXT NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        is_active BOOLEAN DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS reports (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        topic_id INTEGER NOT NULL,
+                        reporter_id INTEGER NOT NULL,
+                        reason TEXT NOT NULL,
+                        status TEXT DEFAULT 'pending',
+                        admin_action TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        resolved_at TIMESTAMP,
+                        admin_id INTEGER,
+                        FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS bans (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL UNIQUE,
+                        reason TEXT NOT NULL,
+                        admin_id INTEGER NOT NULL,
+                        banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        unbanned_at TIMESTAMP,
+                        is_active BOOLEAN DEFAULT 1
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_stats (
+                        user_id INTEGER PRIMARY KEY,
+                        topics_created INTEGER DEFAULT 0,
+                        replies_written INTEGER DEFAULT 0,
+                        replies_received INTEGER DEFAULT 0,
+                        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_names (
+                        user_id INTEGER PRIMARY KEY,
+                        username TEXT NOT NULL UNIQUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS daily_limits (
+                        user_id INTEGER NOT NULL,
+                        date DATE NOT NULL,
+                        topics_created INTEGER DEFAULT 0,
+                        PRIMARY KEY (user_id, date)
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_notifications (
+                        user_id INTEGER PRIMARY KEY,
+                        reply_notifications BOOLEAN DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+            
+            # Создание индексов (одинаково для PostgreSQL и SQLite)
+            indexes = [
+                'CREATE INDEX IF NOT EXISTS idx_topics_user_id ON topics(user_id)',
+                'CREATE INDEX IF NOT EXISTS idx_topics_active ON topics(is_active)',
+                'CREATE INDEX IF NOT EXISTS idx_replies_topic_id ON replies(topic_id)',
+                'CREATE INDEX IF NOT EXISTS idx_replies_user_id ON replies(user_id)',
+                'CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)',
+                'CREATE INDEX IF NOT EXISTS idx_bans_active ON bans(is_active)',
+                'CREATE INDEX IF NOT EXISTS idx_bans_unbanned ON bans(unbanned_at)',
+                'CREATE INDEX IF NOT EXISTS idx_user_names_username ON user_names(username)',
+                'CREATE INDEX IF NOT EXISTS idx_daily_limits_date ON daily_limits(date)'
+            ]
+            
+            for index in indexes:
+                try:
+                    cursor.execute(index)
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка создания индекса {index}: {e}")
+            
+            self.conn.commit()
+            logger.info("✅ База данных инициализирована")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации БД: {e}")
+            self.conn.rollback()
+            raise
 
-db = init_db()
+# Создаем глобальный объект базы данных
+db = Database()
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С БД ====================
+def execute_query(query, params=None, commit=False):
+    """Обертка для выполнения запроса"""
+    return db.execute_query(query, params, commit)
+
+def fetch_one(query, params=None):
+    """Обертка для получения одной записи"""
+    return db.fetch_one(query, params)
+
+def fetch_all(query, params=None):
+    """Обертка для получения всех записей"""
+    return db.fetch_all(query, params)
+
+def get_lastrowid(cursor):
+    """Получение ID последней вставленной записи"""
+    return db.get_lastrowid(cursor)
 
 # ==================== СИСТЕМА УВЕДОМЛЕНИЙ ПОЛЬЗОВАТЕЛЕЙ ====================
 def get_user_notification_settings(user_id):
     """Получение настроек уведомлений пользователя"""
     try:
-        c = db.cursor()
-        c.execute('SELECT reply_notifications FROM user_notifications WHERE user_id = ?', (user_id,))
-        result = c.fetchone()
+        result = fetch_one('SELECT reply_notifications FROM user_notifications WHERE user_id = %s', (user_id,))
         
         if result:
             return {'reply_notifications': bool(result[0])}
         else:
-            c.execute('INSERT INTO user_notifications (user_id, reply_notifications) VALUES (?, 1)', (user_id,))
-            db.commit()
+            execute_query('INSERT INTO user_notifications (user_id, reply_notifications) VALUES (%s, %s)', 
+                         (user_id, True), commit=True)
             return {'reply_notifications': True}
     except Exception as e:
         logger.error(f"Ошибка при получении настроек уведомлений пользователя {user_id}: {e}")
@@ -191,12 +423,23 @@ def get_user_notification_settings(user_id):
 def set_user_notification_settings(user_id, reply_notifications):
     """Обновление настроек уведомлений пользователя"""
     try:
-        c = db.cursor()
-        c.execute('''
-            INSERT OR REPLACE INTO user_notifications (user_id, reply_notifications, updated_at) 
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-        ''', (user_id, 1 if reply_notifications else 0))
-        db.commit()
+        if USE_POSTGRESQL:
+            # PostgreSQL
+            execute_query('''
+                INSERT INTO user_notifications (user_id, reply_notifications, updated_at) 
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) 
+                DO UPDATE SET 
+                    reply_notifications = EXCLUDED.reply_notifications,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (user_id, 1 if reply_notifications else 0), commit=True)
+        else:
+            # SQLite
+            execute_query('''
+                INSERT OR REPLACE INTO user_notifications (user_id, reply_notifications, updated_at) 
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ''', (user_id, 1 if reply_notifications else 0), commit=True)
+        
         return True
     except Exception as e:
         logger.error(f"Ошибка при обновлении настроек уведомлений пользователя {user_id}: {e}")
@@ -236,24 +479,31 @@ def generate_unique_username():
         random_digits = ''.join([str(random.randint(0, 9)) for _ in range(4)])
         username = f"аноним_{random_digits}"
         
-        c = db.cursor()
-        c.execute('SELECT user_id FROM user_names WHERE username = ?', (username,))
-        if not c.fetchone():
+        result = fetch_one('SELECT user_id FROM user_names WHERE username = %s', (username,))
+        if not result:
             return username
 
 def get_username(user_id):
     """Получение имени пользователя, создание уникального если нет"""
     try:
-        c = db.cursor()
-        c.execute('SELECT username FROM user_names WHERE user_id = ?', (user_id,))
-        result = c.fetchone()
+        result = fetch_one('SELECT username FROM user_names WHERE user_id = %s', (user_id,))
         
         if result and result[0]:
             return result[0]
         else:
             username = generate_unique_username()
-            c.execute('INSERT OR IGNORE INTO user_names (user_id, username) VALUES (?, ?)', (user_id, username))
-            db.commit()
+            if USE_POSTGRESQL:
+                # PostgreSQL
+                execute_query('''
+                    INSERT INTO user_names (user_id, username) 
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO NOTHING
+                ''', (user_id, username), commit=True)
+            else:
+                # SQLite
+                execute_query('INSERT OR IGNORE INTO user_names (user_id, username) VALUES (%s, %s)', 
+                             (user_id, username), commit=True)
+            
             logger.info(f"Создано уникальное имя {username} для пользователя {user_id}")
             return username
     except Exception as e:
@@ -391,17 +641,28 @@ def validate_username(username):
 def set_username(user_id, username):
     """Установка имени пользователя"""
     try:
-        c = db.cursor()
-        
-        c.execute('SELECT user_id FROM user_names WHERE username = ? AND user_id != ?', (username, user_id))
-        if c.fetchone():
+        result = fetch_one('SELECT user_id FROM user_names WHERE username = %s AND user_id != %s', 
+                          (username, user_id))
+        if result:
             return False, "Это имя уже занято другим пользователем"
         
-        c.execute('''
-            INSERT OR REPLACE INTO user_names (user_id, username, updated_at) 
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-        ''', (user_id, username))
-        db.commit()
+        if USE_POSTGRESQL:
+            # PostgreSQL
+            execute_query('''
+                INSERT INTO user_names (user_id, username, updated_at) 
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) 
+                DO UPDATE SET 
+                    username = EXCLUDED.username,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (user_id, username), commit=True)
+        else:
+            # SQLite
+            execute_query('''
+                INSERT OR REPLACE INTO user_names (user_id, username, updated_at) 
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ''', (user_id, username), commit=True)
+        
         return True, "Имя успешно изменено"
     except Exception as e:
         logger.error(f"Ошибка при установке имени пользователя {user_id}: {e}")
@@ -412,15 +673,12 @@ def set_username(user_id, username):
 def check_daily_topic_limit(user_id):
     """Проверка дневного лимита создания тем"""
     try:
-        c = db.cursor()
         today = datetime.now().strftime('%Y-%m-%d')
         
-        c.execute('''
+        result = fetch_one('''
             SELECT topics_created FROM daily_limits 
-            WHERE user_id = ? AND date = ?
+            WHERE user_id = %s AND date = %s
         ''', (user_id, today))
-        
-        result = c.fetchone()
         
         if result:
             topics_today = result[0]
@@ -436,17 +694,25 @@ def check_daily_topic_limit(user_id):
 def increment_daily_topic_count(user_id):
     """Увеличение счетчика созданных тем за день"""
     try:
-        c = db.cursor()
         today = datetime.now().strftime('%Y-%m-%d')
         
-        c.execute('''
-            INSERT INTO daily_limits (user_id, date, topics_created)
-            VALUES (?, ?, 1)
-            ON CONFLICT(user_id, date) 
-            DO UPDATE SET topics_created = topics_created + 1
-        ''', (user_id, today))
+        if USE_POSTGRESQL:
+            # PostgreSQL
+            execute_query('''
+                INSERT INTO daily_limits (user_id, date, topics_created)
+                VALUES (%s, %s, 1)
+                ON CONFLICT (user_id, date) 
+                DO UPDATE SET topics_created = daily_limits.topics_created + 1
+            ''', (user_id, today), commit=True)
+        else:
+            # SQLite
+            execute_query('''
+                INSERT INTO daily_limits (user_id, date, topics_created)
+                VALUES (%s, %s, 1)
+                ON CONFLICT(user_id, date) 
+                DO UPDATE SET topics_created = topics_created + 1
+            ''', (user_id, today), commit=True)
         
-        db.commit()
         return True
     except Exception as e:
         logger.error(f"Ошибка при увеличении счетчика тем пользователя {user_id}: {e}")
@@ -457,15 +723,22 @@ def increment_daily_topic_count(user_id):
 def check_user_ban(user_id):
     """Проверка, забанен ли пользователь (возвращает информацию о бане или None)"""
     try:
-        c = db.cursor()
-        c.execute('''
-            SELECT id, reason, unbanned_at FROM bans 
-            WHERE user_id = ? 
-            AND is_active = 1 
-            AND datetime(unbanned_at) > datetime('now')
-        ''', (user_id,))
+        if USE_POSTGRESQL:
+            result = fetch_one('''
+                SELECT id, reason, unbanned_at FROM bans 
+                WHERE user_id = %s 
+                AND is_active = TRUE 
+                AND unbanned_at > CURRENT_TIMESTAMP
+            ''', (user_id,))
+        else:
+            result = fetch_one('''
+                SELECT id, reason, unbanned_at FROM bans 
+                WHERE user_id = %s 
+                AND is_active = 1 
+                AND datetime(unbanned_at) > datetime('now')
+            ''', (user_id,))
         
-        return c.fetchone()
+        return result
     except Exception as e:
         logger.error(f"Ошибка при проверке бана пользователя {user_id}: {e}")
         return None
@@ -478,8 +751,6 @@ def is_user_banned(user_id):
 # ==================== ОСНОВНЫЕ ФУНКЦИИ ====================
 def add_topic(text, user_id):
     """Добавление новой темы с проверкой лимитов"""
-    c = db.cursor()
-    
     if is_user_banned(user_id):
         logger.error(f"🚨 ПОЛЬЗОВАТЕЛЬ {user_id} ЗАБАНЕН! Тема НЕ создана.")
         return None
@@ -492,16 +763,24 @@ def add_topic(text, user_id):
     clean_text = ' '.join(text.strip().split())
     
     try:
-        c.execute('INSERT INTO topics (text, user_id) VALUES (?, ?)', (clean_text, user_id))
+        cursor = execute_query('INSERT INTO topics (text, user_id) VALUES (%s, %s) RETURNING id', 
+                              (clean_text, user_id), commit=False)
         
-        topic_id = c.lastrowid
+        if USE_POSTGRESQL:
+            topic_id = cursor.fetchone()[0]
+        else:
+            topic_id = cursor.lastrowid
         
-        c.execute('''
-            INSERT OR IGNORE INTO user_stats (user_id, topics_created, replies_written, replies_received) 
-            VALUES (?, 0, 0, 0)
-        ''', (user_id,))
-        c.execute('UPDATE user_stats SET topics_created = topics_created + 1 WHERE user_id = ?', (user_id,))
-        c.execute('UPDATE user_stats SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
+        execute_query('''
+            INSERT INTO user_stats (user_id, topics_created, replies_written, replies_received) 
+            VALUES (%s, 0, 0, 0)
+            ON CONFLICT (user_id) DO NOTHING
+        ''', (user_id,), commit=False)
+        
+        execute_query('UPDATE user_stats SET topics_created = topics_created + 1 WHERE user_id = %s', 
+                     (user_id,), commit=False)
+        execute_query('UPDATE user_stats SET last_active = CURRENT_TIMESTAMP WHERE user_id = %s', 
+                     (user_id,), commit=False)
         
         increment_daily_topic_count(user_id)
         
@@ -517,8 +796,6 @@ def add_topic(text, user_id):
 
 def add_reply(topic_id, text, user_id):
     """Добавление ответа к теме с уведомлением автора"""
-    c = db.cursor()
-    
     if is_user_banned(user_id):
         logger.error(f"🚨 ПОЛЬЗОВАТЕЛЬ {user_id} ЗАБАНЕН! Ответ НЕ создан.")
         return None
@@ -526,38 +803,48 @@ def add_reply(topic_id, text, user_id):
     clean_text = ' '.join(text.strip().split())
     
     try:
-        c.execute('SELECT user_id, is_active FROM topics WHERE id = ?', (topic_id,))
-        topic = c.fetchone()
+        result = fetch_one('SELECT user_id, is_active FROM topics WHERE id = %s', (topic_id,))
         
-        if not topic:
+        if not result:
             logger.error(f"❌ Тема #{topic_id} не найдена")
             return None
         
-        topic_author_id = topic[0]
-        is_active = topic[1]
+        topic_author_id, is_active = result
         
         if not is_active:
             logger.error(f"❌ Тема #{topic_id} закрыта")
             return "closed"
         
-        c.execute('INSERT INTO replies (topic_id, text, user_id) VALUES (?, ?, ?)', 
-                  (topic_id, clean_text, user_id))
-        c.execute('UPDATE topics SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', (topic_id,))
+        cursor = execute_query('INSERT INTO replies (topic_id, text, user_id) VALUES (%s, %s, %s) RETURNING id', 
+                              (topic_id, clean_text, user_id), commit=False)
         
-        reply_id = c.lastrowid
+        if USE_POSTGRESQL:
+            reply_id = cursor.fetchone()[0]
+        else:
+            reply_id = cursor.lastrowid
         
-        c.execute('''
-            INSERT OR IGNORE INTO user_stats (user_id, topics_created, replies_written, replies_received) 
-            VALUES (?, 0, 0, 0)
-        ''', (user_id,))
-        c.execute('UPDATE user_stats SET replies_written = replies_written + 1 WHERE user_id = ?', (user_id,))
-        c.execute('UPDATE user_stats SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
+        execute_query('UPDATE topics SET updated_at = CURRENT_TIMESTAMP WHERE id = %s', 
+                     (topic_id,), commit=False)
         
-        c.execute('''
-            INSERT OR IGNORE INTO user_stats (user_id, topics_created, replies_written, replies_received) 
-            VALUES (?, 0, 0, 0)
-        ''', (topic_author_id,))
-        c.execute('UPDATE user_stats SET replies_received = replies_received + 1 WHERE user_id = ?', (topic_author_id,))
+        execute_query('''
+            INSERT INTO user_stats (user_id, topics_created, replies_written, replies_received) 
+            VALUES (%s, 0, 0, 0)
+            ON CONFLICT (user_id) DO NOTHING
+        ''', (user_id,), commit=False)
+        
+        execute_query('UPDATE user_stats SET replies_written = replies_written + 1 WHERE user_id = %s', 
+                     (user_id,), commit=False)
+        execute_query('UPDATE user_stats SET last_active = CURRENT_TIMESTAMP WHERE user_id = %s', 
+                     (user_id,), commit=False)
+        
+        execute_query('''
+            INSERT INTO user_stats (user_id, topics_created, replies_written, replies_received) 
+            VALUES (%s, 0, 0, 0)
+            ON CONFLICT (user_id) DO NOTHING
+        ''', (topic_author_id,), commit=False)
+        
+        execute_query('UPDATE user_stats SET replies_received = replies_received + 1 WHERE user_id = %s', 
+                     (topic_author_id,), commit=False)
         
         db.commit()
         
@@ -574,29 +861,26 @@ def add_reply(topic_id, text, user_id):
 
 def get_topic(topic_id, user_id=None):
     """Получение темы"""
-    c = db.cursor()
     if user_id:
-        c.execute('SELECT * FROM topics WHERE id = ?', (topic_id,))
+        result = fetch_one('SELECT * FROM topics WHERE id = %s', (topic_id,))
     else:
-        c.execute('SELECT * FROM topics WHERE id = ? AND is_active = 1', (topic_id,))
-    return c.fetchone()
+        result = fetch_one('SELECT * FROM topics WHERE id = %s AND is_active = %s', 
+                          (topic_id, True if USE_POSTGRESQL else 1))
+    return result
 
 def close_topic(topic_id, user_id):
     """Закрытие темы"""
-    c = db.cursor()
-    
     try:
-        c.execute('SELECT user_id FROM topics WHERE id = ?', (topic_id,))
-        topic = c.fetchone()
+        result = fetch_one('SELECT user_id FROM topics WHERE id = %s', (topic_id,))
         
-        if not topic:
+        if not result:
             return False, "Тема не найдена"
         
-        if topic[0] != user_id:
+        if result[0] != user_id:
             return False, "Вы не автор этой темы"
         
-        c.execute('UPDATE topics SET is_active = 0 WHERE id = ?', (topic_id,))
-        db.commit()
+        execute_query('UPDATE topics SET is_active = %s WHERE id = %s', 
+                     (False if USE_POSTGRESQL else 0, topic_id), commit=True)
         
         logger.info(f"✅ Тема #{topic_id} закрыта пользователем {user_id}")
         return True, "✅ Тема закрыта"
@@ -608,31 +892,28 @@ def close_topic(topic_id, user_id):
 
 def delete_topic(topic_id, user_id):
     """Удаление темы со всеми ответами"""
-    c = db.cursor()
-    
     try:
         # Получаем информацию о теме
-        c.execute('SELECT user_id FROM topics WHERE id = ?', (topic_id,))
-        topic = c.fetchone()
+        result = fetch_one('SELECT user_id FROM topics WHERE id = %s', (topic_id,))
         
-        if not topic:
+        if not result:
             return False, "Тема не найдена"
         
-        if topic[0] != user_id:
+        if result[0] != user_id:
             return False, "Вы не автор этой темы"
         
         # Получаем количество ответов перед удалением для логирования
-        c.execute('SELECT COUNT(*) FROM replies WHERE topic_id = ?', (topic_id,))
-        replies_count = c.fetchone()[0] or 0
+        result = fetch_one('SELECT COUNT(*) FROM replies WHERE topic_id = %s', (topic_id,))
+        replies_count = result[0] or 0
         
         # Удаляем все ответы темы
-        c.execute('DELETE FROM replies WHERE topic_id = ?', (topic_id,))
+        execute_query('DELETE FROM replies WHERE topic_id = %s', (topic_id,), commit=False)
         
         # Удаляем тему
-        c.execute('DELETE FROM topics WHERE id = ?', (topic_id,))
+        execute_query('DELETE FROM topics WHERE id = %s', (topic_id,), commit=False)
         
         # Удаляем все жалобы на эту тему
-        c.execute('DELETE FROM reports WHERE topic_id = ?', (topic_id,))
+        execute_query('DELETE FROM reports WHERE topic_id = %s', (topic_id,), commit=False)
         
         db.commit()
         
@@ -646,118 +927,120 @@ def delete_topic(topic_id, user_id):
 
 def get_random_topic(exclude_user_id=None, viewed_topics=None):
     """Получение случайной активной темы с исключением просмотренных"""
-    c = db.cursor()
-    
     if viewed_topics and len(viewed_topics) > 0:
-        viewed_str = ','.join(map(str, viewed_topics))
+        viewed_placeholders = ','.join(['%s'] * len(viewed_topics))
+        params = tuple(viewed_topics)
         
         if exclude_user_id:
-            c.execute(f'''
+            query = f'''
                 SELECT * FROM topics 
-                WHERE is_active = 1 
-                AND user_id != ? 
-                AND id NOT IN ({viewed_str})
+                WHERE is_active = %s 
+                AND user_id != %s 
+                AND id NOT IN ({viewed_placeholders})
                 ORDER BY RANDOM() 
                 LIMIT 1
-            ''', (exclude_user_id,))
+            '''
+            params = (True if USE_POSTGRESQL else 1, exclude_user_id) + params
         else:
-            c.execute(f'''
+            query = f'''
                 SELECT * FROM topics 
-                WHERE is_active = 1 
-                AND id NOT IN ({viewed_str})
+                WHERE is_active = %s 
+                AND id NOT IN ({viewed_placeholders})
                 ORDER BY RANDOM() 
                 LIMIT 1
-            ''')
+            '''
+            params = (True if USE_POSTGRESQL else 1,) + params
     else:
         if exclude_user_id:
-            c.execute('SELECT * FROM topics WHERE is_active = 1 AND user_id != ? ORDER BY RANDOM() LIMIT 1', 
-                     (exclude_user_id,))
+            query = '''
+                SELECT * FROM topics 
+                WHERE is_active = %s AND user_id != %s 
+                ORDER BY RANDOM() LIMIT 1
+            '''
+            params = (True if USE_POSTGRESQL else 1, exclude_user_id)
         else:
-            c.execute('SELECT * FROM topics WHERE is_active = 1 ORDER BY RANDOM() LIMIT 1')
+            query = '''
+                SELECT * FROM topics 
+                WHERE is_active = %s 
+                ORDER BY RANDOM() LIMIT 1
+            '''
+            params = (True if USE_POSTGRESQL else 1,)
     
-    return c.fetchone()
+    return fetch_one(query, params)
 
 def get_all_active_topics_count(exclude_user_id=None):
     """Получение количества всех активных тем"""
-    c = db.cursor()
     if exclude_user_id:
-        c.execute('SELECT COUNT(*) FROM topics WHERE is_active = 1 AND user_id != ?', (exclude_user_id,))
+        result = fetch_one('SELECT COUNT(*) FROM topics WHERE is_active = %s AND user_id != %s', 
+                          (True if USE_POSTGRESQL else 1, exclude_user_id))
     else:
-        c.execute('SELECT COUNT(*) FROM topics WHERE is_active = 1')
-    return c.fetchone()[0]
+        result = fetch_one('SELECT COUNT(*) FROM topics WHERE is_active = %s', 
+                          (True if USE_POSTGRESQL else 1,))
+    return result[0] if result else 0
 
 def get_user_topics(user_id, limit=10, offset=0):
     """Получение тем пользователя"""
-    c = db.cursor()
-    c.execute('''
+    return fetch_all('''
         SELECT t.*, COUNT(r.id) as replies_count
         FROM topics t
-        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = 1
-        WHERE t.user_id = ?
+        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = %s
+        WHERE t.user_id = %s
         GROUP BY t.id
         ORDER BY t.updated_at DESC 
-        LIMIT ? OFFSET ?
-    ''', (user_id, limit, offset))
-    return c.fetchall()
+        LIMIT %s OFFSET %s
+    ''', (True if USE_POSTGRESQL else 1, user_id, limit, offset))
 
 def get_topic_replies(topic_id, limit=5, offset=0):
     """Получение ответов к теме"""
-    c = db.cursor()
-    c.execute('''
+    return fetch_all('''
         SELECT r.*
         FROM replies r
-        WHERE r.topic_id = ? AND r.is_active = 1
+        WHERE r.topic_id = %s AND r.is_active = %s
         ORDER BY r.created_at ASC
-        LIMIT ? OFFSET ?
-    ''', (topic_id, limit, offset))
-    return c.fetchall()
+        LIMIT %s OFFSET %s
+    ''', (topic_id, True if USE_POSTGRESQL else 1, limit, offset))
 
 def get_replies_count(topic_id):
     """Количество активных ответов"""
-    c = db.cursor()
-    c.execute('SELECT COUNT(*) FROM replies WHERE topic_id = ? AND is_active = 1', (topic_id,))
-    return c.fetchone()[0]
+    result = fetch_one('SELECT COUNT(*) FROM replies WHERE topic_id = %s AND is_active = %s', 
+                      (topic_id, True if USE_POSTGRESQL else 1))
+    return result[0] if result else 0
 
 def get_popular_topics(limit=5):
     """Популярные темы"""
-    c = db.cursor()
-    c.execute('''
+    return fetch_all('''
         SELECT t.*, COUNT(r.id) as replies_count
         FROM topics t
-        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = 1
-        WHERE t.is_active = 1
+        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = %s
+        WHERE t.is_active = %s
         GROUP BY t.id
         ORDER BY replies_count DESC, t.updated_at DESC
-        LIMIT ?
-    ''', (limit,))
-    return c.fetchall()
+        LIMIT %s
+    ''', (True if USE_POSTGRESQL else 1, True if USE_POSTGRESQL else 1, limit))
 
 def get_popular_topics_with_ownership(user_id, limit=5, offset=0):
     """Популярные темы с пометкой принадлежности пользователю"""
-    c = db.cursor()
-    c.execute('''
+    return fetch_all('''
         SELECT t.*, COUNT(r.id) as replies_count,
-               CASE WHEN t.user_id = ? THEN 1 ELSE 0 END as is_owner
+               CASE WHEN t.user_id = %s THEN 1 ELSE 0 END as is_owner
         FROM topics t
-        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = 1
-        WHERE t.is_active = 1
+        LEFT JOIN replies r ON t.id = r.topic_id AND r.is_active = %s
+        WHERE t.is_active = %s
         GROUP BY t.id
         ORDER BY replies_count DESC, t.updated_at DESC
-        LIMIT ? OFFSET ?
-    ''', (user_id, limit, offset))
-    return c.fetchall()
+        LIMIT %s OFFSET %s
+    ''', (user_id, True if USE_POSTGRESQL else 1, True if USE_POSTGRESQL else 1, limit, offset))
 
 # ==================== СИСТЕМА ЖАЛОБ ====================
 def add_report(topic_id, reporter_id, reason):
     """Добавление жалобы"""
-    c = db.cursor()
     try:
-        c.execute('''
+        cursor = execute_query('''
             INSERT INTO reports (topic_id, reporter_id, reason, status) 
-            VALUES (?, ?, ?, 'pending')
-        ''', (topic_id, reporter_id, reason))
-        db.commit()
-        return c.lastrowid
+            VALUES (%s, %s, %s, 'pending') RETURNING id
+        ''', (topic_id, reporter_id, reason), commit=True)
+        
+        return get_lastrowid(cursor)
     except Exception as e:
         logger.error(f"Ошибка при добавлении жалобы: {e}")
         db.rollback()
@@ -766,14 +1049,12 @@ def add_report(topic_id, reporter_id, reason):
 def get_report(report_id):
     """Получение жалобы по ID"""
     try:
-        c = db.cursor()
-        c.execute('''
+        return fetch_one('''
             SELECT r.*, t.text as topic_text, t.user_id as topic_author_id
             FROM reports r
             LEFT JOIN topics t ON r.topic_id = t.id
-            WHERE r.id = ?
+            WHERE r.id = %s
         ''', (report_id,))
-        return c.fetchone()
     except Exception as e:
         logger.error(f"Ошибка при получении жалобы #{report_id}: {e}")
         return None
@@ -781,32 +1062,28 @@ def get_report(report_id):
 def get_pending_reports(limit=10, offset=0):
     """Получение ожидающих жалоб"""
     try:
-        c = db.cursor()
-        c.execute('''
+        return fetch_all('''
             SELECT r.*, t.text as topic_text, t.user_id as topic_author_id
             FROM reports r
             LEFT JOIN topics t ON r.topic_id = t.id
             WHERE r.status = 'pending'
             ORDER BY r.created_at ASC
-            LIMIT ? OFFSET ?
+            LIMIT %s OFFSET %s
         ''', (limit, offset))
-        return c.fetchall()
     except Exception as e:
         logger.error(f"Ошибка при получении списка жалоб: {e}")
         return []
 
 def ban_user(user_id, reason, admin_id, days=1):
     """Бан пользователя на указанное количество дней"""
-    c = db.cursor()
-    
     try:
-        c.execute('DELETE FROM bans WHERE user_id = ?', (user_id,))
+        execute_query('DELETE FROM bans WHERE user_id = %s', (user_id,), commit=False)
         
         unbanned_at = datetime.now() + timedelta(days=days)
-        c.execute('''
+        execute_query('''
             INSERT INTO bans (user_id, reason, admin_id, unbanned_at) 
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, reason, admin_id, unbanned_at.strftime('%Y-%m-%d %H:%M:%S')))
+            VALUES (%s, %s, %s, %s)
+        ''', (user_id, reason, admin_id, unbanned_at.strftime('%Y-%m-%d %H:%M:%S')), commit=False)
         
         db.commit()
         
@@ -821,33 +1098,28 @@ def ban_user(user_id, reason, admin_id, days=1):
 
 def unban_user(user_id):
     """Разбан пользователя"""
-    c = db.cursor()
-    c.execute('UPDATE bans SET is_active = 0 WHERE user_id = ?', (user_id,))
-    db.commit()
+    execute_query('UPDATE bans SET is_active = %s WHERE user_id = %s', 
+                 (False if USE_POSTGRESQL else 0, user_id), commit=True)
     return True
 
 # ==================== СТАТИСТИКА И ТОПЫ ====================
 def get_user_statistics(user_id):
     """Получение статистики пользователя"""
-    c = db.cursor()
-    c.execute('SELECT * FROM user_stats WHERE user_id = ?', (user_id,))
-    stats = c.fetchone()
+    result = fetch_one('SELECT * FROM user_stats WHERE user_id = %s', (user_id,))
     
-    if not stats:
+    if not result:
         return {'topics_created': 0, 'replies_written': 0, 'replies_received': 0}
     
     return {
-        'topics_created': stats[1],
-        'replies_written': stats[2],
-        'replies_received': stats[3]
+        'topics_created': result[1],
+        'replies_written': result[2],
+        'replies_received': result[3]
     }
 
 def get_top_users(limit=10):
     """Получение топ пользователей по сумме тем и ответов"""
-    c = db.cursor()
-    
     try:
-        c.execute('''
+        result = fetch_all('''
             SELECT 
                 us.user_id,
                 COALESCE(un.username, 'user_' || us.user_id) as username,
@@ -858,13 +1130,11 @@ def get_top_users(limit=10):
             LEFT JOIN user_names un ON us.user_id = un.user_id
             WHERE us.topics_created > 0 OR us.replies_written > 0
             ORDER BY total_activity DESC, us.replies_written DESC, us.topics_created DESC
-            LIMIT ?
+            LIMIT %s
         ''', (limit,))
         
-        result = c.fetchall()
-        
         if not result or len(result) == 0:
-            c.execute('''
+            result = fetch_all('''
                 SELECT DISTINCT 
                     t.user_id as user_id,
                     COALESCE(un.username, 'user_' || t.user_id) as username,
@@ -876,10 +1146,8 @@ def get_top_users(limit=10):
                 WHERE t.user_id IS NOT NULL
                 GROUP BY t.user_id
                 ORDER BY topics_created DESC
-                LIMIT ?
+                LIMIT %s
             ''', (limit,))
-            
-            result = c.fetchall()
         
         return result
         
@@ -889,28 +1157,42 @@ def get_top_users(limit=10):
 
 def get_weekly_record():
     """Получение рекорда недели (тема с максимальным количеством ответов за неделю)"""
-    c = db.cursor()
-    c.execute('''
-        SELECT 
-            t.id as topic_id,
-            t.text,
-            COUNT(r.id) as replies_count,
-            COALESCE(un.username, 'user_' || t.user_id) as author_name
-        FROM topics t
-        LEFT JOIN replies r ON t.id = r.topic_id
-        LEFT JOIN user_names un ON t.user_id = un.user_id
-        WHERE t.created_at > datetime('now', '-7 days')
-        AND t.is_active = 1
-        GROUP BY t.id
-        ORDER BY replies_count DESC
-        LIMIT 1
-    ''')
-    return c.fetchone()
+    if USE_POSTGRESQL:
+        return fetch_one('''
+            SELECT 
+                t.id as topic_id,
+                t.text,
+                COUNT(r.id) as replies_count,
+                COALESCE(un.username, 'user_' || t.user_id) as author_name
+            FROM topics t
+            LEFT JOIN replies r ON t.id = r.topic_id
+            LEFT JOIN user_names un ON t.user_id = un.user_id
+            WHERE t.created_at > CURRENT_TIMESTAMP - INTERVAL '7 days'
+            AND t.is_active = TRUE
+            GROUP BY t.id, t.text, t.user_id, un.username
+            ORDER BY replies_count DESC
+            LIMIT 1
+        ''')
+    else:
+        return fetch_one('''
+            SELECT 
+                t.id as topic_id,
+                t.text,
+                COUNT(r.id) as replies_count,
+                COALESCE(un.username, 'user_' || t.user_id) as author_name
+            FROM topics t
+            LEFT JOIN replies r ON t.id = r.topic_id
+            LEFT JOIN user_names un ON t.user_id = un.user_id
+            WHERE t.created_at > datetime('now', '-7 days')
+            AND t.is_active = 1
+            GROUP BY t.id
+            ORDER BY replies_count DESC
+            LIMIT 1
+        ''')
 
 def get_replies_leader():
     """Получение лидера по количеству написанных ответов"""
-    c = db.cursor()
-    c.execute('''
+    return fetch_one('''
         SELECT 
             us.user_id,
             COALESCE(un.username, 'user_' || us.user_id) as username,
@@ -921,7 +1203,6 @@ def get_replies_leader():
         ORDER BY us.replies_written DESC
         LIMIT 1
     ''')
-    return c.fetchone()
 
 def get_top_statistics():
     """Получение всей статистики для команды /top"""
@@ -940,10 +1221,9 @@ def get_top_statistics():
 
 def get_admin_statistics():
     """Получение общей статистики для админа"""
-    c = db.cursor()
-    
     try:
-        c.execute('''
+        # Все уникальные пользователи
+        result = fetch_one('''
             SELECT COUNT(DISTINCT user_id) FROM (
                 SELECT user_id FROM topics
                 UNION
@@ -952,34 +1232,59 @@ def get_admin_statistics():
                 SELECT user_id FROM user_names
                 UNION
                 SELECT user_id FROM user_stats
-            )
+            ) as all_users
         ''')
-        total_users = c.fetchone()[0] or 0
+        total_users = result[0] or 0 if result else 0
         
-        c.execute('''
-            SELECT COUNT(DISTINCT user_id) FROM (
-                SELECT user_id FROM topics WHERE created_at > datetime('now', '-24 hours')
-                UNION
-                SELECT user_id FROM replies WHERE created_at > datetime('now', '-24 hours')
-            )
-        ''')
-        active_24h = c.fetchone()[0] or 0
+        # Активные за 24 часа
+        if USE_POSTGRESQL:
+            result = fetch_one('''
+                SELECT COUNT(DISTINCT user_id) FROM (
+                    SELECT user_id FROM topics WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                    UNION
+                    SELECT user_id FROM replies WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                ) as active_users
+            ''')
+        else:
+            result = fetch_one('''
+                SELECT COUNT(DISTINCT user_id) FROM (
+                    SELECT user_id FROM topics WHERE created_at > datetime('now', '-24 hours')
+                    UNION
+                    SELECT user_id FROM replies WHERE created_at > datetime('now', '-24 hours')
+                )
+            ''')
+        active_24h = result[0] or 0 if result else 0
         
-        c.execute('''
-            SELECT COUNT(DISTINCT user_id) FROM (
-                SELECT user_id, MIN(created_at) as first_action FROM (
-                    SELECT user_id, created_at FROM topics
-                    UNION ALL
-                    SELECT user_id, created_at FROM replies
-                ) 
-                GROUP BY user_id
-                HAVING first_action > datetime('now', '-24 hours')
-            )
-        ''')
-        new_24h = c.fetchone()[0] or 0
+        # Новые за 24 часа
+        if USE_POSTGRESQL:
+            result = fetch_one('''
+                SELECT COUNT(DISTINCT user_id) FROM (
+                    SELECT user_id, MIN(created_at) as first_action FROM (
+                        SELECT user_id, created_at FROM topics
+                        UNION ALL
+                        SELECT user_id, created_at FROM replies
+                    ) as all_actions
+                    GROUP BY user_id
+                    HAVING MIN(created_at) > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                ) as new_users
+            ''')
+        else:
+            result = fetch_one('''
+                SELECT COUNT(DISTINCT user_id) FROM (
+                    SELECT user_id, MIN(created_at) as first_action FROM (
+                        SELECT user_id, created_at FROM topics
+                        UNION ALL
+                        SELECT user_id, created_at FROM replies
+                    ) 
+                    GROUP BY user_id
+                    HAVING first_action > datetime('now', '-24 hours')
+                )
+            ''')
+        new_24h = result[0] or 0 if result else 0
         
-        if new_24h == 0:
-            c.execute('''
+        if new_24h == 0 and not USE_POSTGRESQL:
+            # Дополнительная проверка для SQLite
+            result = fetch_one('''
                 SELECT COUNT(DISTINCT user_id) FROM user_stats 
                 WHERE last_active > datetime('now', '-24 hours')
                 AND user_id NOT IN (
@@ -990,25 +1295,40 @@ def get_admin_statistics():
                     WHERE created_at <= datetime('now', '-24 hours')
                 )
             ''')
-            new_24h = c.fetchone()[0] or 0
+            new_24h = result[0] or 0 if result else 0
         
-        c.execute("SELECT COUNT(*) FROM topics")
-        total_topics = c.fetchone()[0] or 0
+        # Общее количество тем
+        result = fetch_one("SELECT COUNT(*) FROM topics")
+        total_topics = result[0] or 0 if result else 0
         
-        c.execute("SELECT COUNT(*) FROM topics WHERE created_at > datetime('now', '-24 hours')")
-        new_topics_24h = c.fetchone()[0] or 0
+        # Новые темы за 24 часа
+        if USE_POSTGRESQL:
+            result = fetch_one("SELECT COUNT(*) FROM topics WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'")
+        else:
+            result = fetch_one("SELECT COUNT(*) FROM topics WHERE created_at > datetime('now', '-24 hours')")
+        new_topics_24h = result[0] or 0 if result else 0
         
-        c.execute("SELECT COUNT(*) FROM replies")
-        total_replies = c.fetchone()[0] or 0
+        # Общее количество ответов
+        result = fetch_one("SELECT COUNT(*) FROM replies")
+        total_replies = result[0] or 0 if result else 0
         
-        c.execute("SELECT COUNT(*) FROM reports WHERE status = 'pending'")
-        active_reports = c.fetchone()[0] or 0
+        # Активные жалобы
+        result = fetch_one("SELECT COUNT(*) FROM reports WHERE status = 'pending'")
+        active_reports = result[0] or 0 if result else 0
         
-        c.execute("SELECT COUNT(*) FROM reports WHERE created_at > datetime('now', '-24 hours')")
-        reports_24h = c.fetchone()[0] or 0
+        # Жалобы за 24 часа
+        if USE_POSTGRESQL:
+            result = fetch_one("SELECT COUNT(*) FROM reports WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'")
+        else:
+            result = fetch_one("SELECT COUNT(*) FROM reports WHERE created_at > datetime('now', '-24 hours')")
+        reports_24h = result[0] or 0 if result else 0
         
-        c.execute("SELECT COUNT(*) FROM bans WHERE banned_at > datetime('now', '-24 hours')")
-        bans_24h = c.fetchone()[0] or 0
+        # Баны за 24 часа
+        if USE_POSTGRESQL:
+            result = fetch_one("SELECT COUNT(*) FROM bans WHERE banned_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'")
+        else:
+            result = fetch_one("SELECT COUNT(*) FROM bans WHERE banned_at > datetime('now', '-24 hours')")
+        bans_24h = result[0] or 0 if result else 0
         
         return {
             'total_users': total_users,
@@ -1038,16 +1358,13 @@ def get_admin_statistics():
 
 def update_report_status(report_id, status, admin_id, action=None):
     """Обновление статуса жалобы"""
-    c = db.cursor()
-    
     try:
-        c.execute('''
+        execute_query('''
             UPDATE reports 
-            SET status = ?, admin_action = ?, admin_id = ?, resolved_at = CURRENT_TIMESTAMP 
-            WHERE id = ?
-        ''', (status, action, admin_id, report_id))
+            SET status = %s, admin_action = %s, admin_id = %s, resolved_at = CURRENT_TIMESTAMP 
+            WHERE id = %s
+        ''', (status, action, admin_id, report_id), commit=True)
         
-        db.commit()
         return True
     except Exception as e:
         logger.error(f"Ошибка при обновлении статуса жалобы #{report_id}: {e}")
@@ -1057,8 +1374,7 @@ def update_report_status(report_id, status, admin_id, action=None):
 def cleanup_invalid_reports():
     """Очистка невалидных жалоб"""
     try:
-        c = db.cursor()
-        c.execute('''
+        cursor = execute_query('''
             DELETE FROM reports 
             WHERE id IN (
                 SELECT r.id 
@@ -1066,31 +1382,27 @@ def cleanup_invalid_reports():
                 LEFT JOIN topics t ON r.topic_id = t.id
                 WHERE t.id IS NULL AND r.status = 'pending'
             )
-        ''')
-        deleted_count = c.rowcount
+        ''', commit=True)
+        
+        deleted_count = cursor.rowcount if cursor else 0
         if deleted_count > 0:
             logger.info(f"Удалено {deleted_count} невалидных жалоб")
-        db.commit()
     except Exception as e:
         logger.error(f"Ошибка при очистке жалоб: {e}")
 
 def delete_topic_admin(topic_id, admin_id, reason):
     """Удаление темы администратором"""
-    c = db.cursor()
-    
     try:
-        c.execute('SELECT user_id, text FROM topics WHERE id = ?', (topic_id,))
-        topic_info = c.fetchone()
+        result = fetch_one('SELECT user_id, text FROM topics WHERE id = %s', (topic_id,))
         
-        if not topic_info:
+        if not result:
             return False, "Тема не найдена"
         
-        topic_author_id = topic_info[0]
-        topic_text = topic_info[1]
+        topic_author_id, topic_text = result
         
-        c.execute('DELETE FROM replies WHERE topic_id = ?', (topic_id,))
-        c.execute('DELETE FROM topics WHERE id = ?', (topic_id,))
-        c.execute('DELETE FROM reports WHERE topic_id = ?', (topic_id,))
+        execute_query('DELETE FROM replies WHERE topic_id = %s', (topic_id,), commit=False)
+        execute_query('DELETE FROM topics WHERE id = %s', (topic_id,), commit=False)
+        execute_query('DELETE FROM reports WHERE topic_id = %s', (topic_id,), commit=False)
         
         db.commit()
         
@@ -1180,14 +1492,12 @@ def send_reply_notification(user_id, topic_id, reply_id, reply_text):
             logger.info(f"Уведомления отключены у пользователя {user_id}, пропускаем отправку")
             return
             
-        c = db.cursor()
-        c.execute('SELECT text FROM topics WHERE id = ?', (topic_id,))
-        topic = c.fetchone()
+        result = fetch_one('SELECT text FROM topics WHERE id = %s', (topic_id,))
         
-        if not topic:
+        if not result:
             return
         
-        topic_text = topic[0]
+        topic_text = result[0]
         preview = topic_text[:60] + "..." if len(topic_text) > 60 else topic_text
         reply_preview = reply_text[:100] + "..." if len(reply_text) > 100 else reply_text
         
@@ -1431,17 +1741,18 @@ def start_command(message):
     
     reset_user_viewed_topics(user_id)
     
-    c = db.cursor()
-    c.execute('''
-    INSERT OR IGNORE INTO user_stats (user_id, topics_created, replies_written, replies_received) 
-    VALUES (?, 0, 0, 0)
-    ''', (user_id,))
-    c.execute('UPDATE user_stats SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
+    execute_query('''
+    INSERT INTO user_stats (user_id, topics_created, replies_written, replies_received) 
+    VALUES (%s, 0, 0, 0)
+    ON CONFLICT (user_id) DO NOTHING
+    ''', (user_id,), commit=False)
+    execute_query('UPDATE user_stats SET last_active = CURRENT_TIMESTAMP WHERE user_id = %s', (user_id,), commit=False)
     
-    c.execute('''
-    INSERT OR IGNORE INTO user_notifications (user_id, reply_notifications) 
-    VALUES (?, 1)
-    ''', (user_id,))
+    execute_query('''
+    INSERT INTO user_notifications (user_id, reply_notifications) 
+    VALUES (%s, %s)
+    ON CONFLICT (user_id) DO NOTHING
+    ''', (user_id, True), commit=False)
     
     db.commit()
     
@@ -1459,7 +1770,7 @@ def show_main_menu(chat_id, user_id):
     
     text = f"""<b>🗄️ АРХИВ МЫСЛЕЙ</b>
 
-Привет, <b>{username}</b>! 
+Привет, <b>{username}</b>! 👋
 
 📌 <b>Основные функции:</b>
 • Создавайте анонимные темы (макс. {DAILY_TOPIC_LIMIT}/день)
@@ -1810,9 +2121,8 @@ def admin_reports_callback(call):
         
         reports = get_pending_reports(limit=per_page, offset=offset)
         
-        c = db.cursor()
-        c.execute('SELECT COUNT(*) FROM reports WHERE status = "pending"')
-        total_reports = c.fetchone()[0] or 0
+        result = fetch_one('SELECT COUNT(*) FROM reports WHERE status = "pending"')
+        total_reports = result[0] or 0 if result else 0
         
         if not reports and page == 1:
             text = """<b>📋 ЖАЛОБЫ</b>
@@ -2082,9 +2392,8 @@ def my_topics_callback(call):
         
         topics = get_user_topics(user_id, limit=per_page, offset=offset)
         
-        c = db.cursor()
-        c.execute('SELECT COUNT(*) FROM topics WHERE user_id = ?', (user_id,))
-        total_topics = c.fetchone()[0] or 0
+        result = fetch_one('SELECT COUNT(*) FROM topics WHERE user_id = %s', (user_id,))
+        total_topics = result[0] or 0 if result else 0
         
         if not topics and page == 1:
             text = """<b>📭 НЕТ ВАШИХ ТЕМ</b>
@@ -2175,9 +2484,9 @@ def popular_topics_callback(call):
         
         topics = get_popular_topics_with_ownership(user_id, limit=per_page, offset=offset)
         
-        c = db.cursor()
-        c.execute('SELECT COUNT(*) FROM topics WHERE is_active = 1')
-        total_topics = c.fetchone()[0] or 0
+        result = fetch_one('SELECT COUNT(*) FROM topics WHERE is_active = %s', 
+                          (True if USE_POSTGRESQL else 1,))
+        total_topics = result[0] or 0 if result else 0
         
         if not topics and page == 1:
             text = """<b>📭 НЕТ ПОПУЛЯРНЫХ ТЕМ</b>
@@ -2408,7 +2717,7 @@ def handle_delete_topic(call):
 
 При удалении темы:
 • Все ответы к теме будут удалены
-• Тема исчезнет из архива
+• Тема исчезнет из архиве
 • Уведомления прекратятся
 • Статистика ответов сохранится
 
@@ -2473,11 +2782,10 @@ def report_topic_callback(call):
     try:
         topic_id = int(call.data.split("_")[2])
         
-        c = db.cursor()
-        c.execute('SELECT id FROM reports WHERE topic_id = ? AND reporter_id = ? AND status = "pending"', (topic_id, user_id))
-        existing_report = c.fetchone()
+        result = fetch_one('SELECT id FROM reports WHERE topic_id = %s AND reporter_id = %s AND status = "pending"', 
+                          (topic_id, user_id))
         
-        if existing_report:
+        if result:
             bot.answer_callback_query(call.id, "⚠️ Вы уже жаловались на эту тему", show_alert=True)
             return
         
@@ -2816,7 +3124,7 @@ def menu_banned_callback(call):
 # ==================== ЗАПУСК ДЛЯ RAILWAY ====================
 if __name__ == '__main__':
     logger.info("🗄️ Бот 'Архив мыслей' запущен...")
-    logger.info(f"📂 База данных: {DB_NAME}")
+    logger.info(f"📂 Используем: {'PostgreSQL на Railway' if USE_POSTGRESQL else 'SQLite локально'}")
     logger.info("✅ Все данные сохранены (темы, ответы, статусы)")
     logger.info("👤 Система уникальных имен 'аноним_XXXX' активирована")
     logger.info("🔔 Система уведомлений активирована")
