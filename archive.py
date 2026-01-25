@@ -1,43 +1,59 @@
 # ============================================================
-# TELEGRAM BOT — FULL VERSION (PostgreSQL, Railway-ready)
-# Part 1/6
+# Telegram Anonymous Thoughts Bot
+# PostgreSQL version (Railway compatible)
+# Block 1/8 — Config, ENV, Logging, DB connection
 # ============================================================
+
+import os
+import sys
+import time
+import logging
+import traceback
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 
 import telebot
 import psycopg2
 import psycopg2.extras
-import os
-import random
-import logging
-import time
-import html
-import re
-from datetime import datetime, timedelta
-from contextlib import contextmanager
 
-# ==================== ENV ====================
+# ===================== ENV =====================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-DAILY_TOPIC_LIMIT = 5
+# ===================== CONSTANTS =====================
 
-# ==================== LOGGING ====================
+DAILY_TOPIC_LIMIT = 5
+REPLIES_PAGE_SIZE = 5
+TOPICS_PAGE_SIZE = 5
+RECONNECT_DELAY = 5  # seconds
+
+# ===================== LOGGING =====================
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    stream=sys.stdout
 )
+
 logger = logging.getLogger("thoughts_bot")
 
-# ==================== POSTGRES ====================
+logger.info("Starting bot process...")
+
+# ===================== POSTGRES =====================
 
 @contextmanager
 def get_conn():
+    """
+    Safe PostgreSQL connection context manager.
+    Auto-commit / rollback.
+    """
     conn = psycopg2.connect(
         DATABASE_URL,
         sslmode="require",
@@ -52,124 +68,208 @@ def get_conn():
     finally:
         conn.close()
 
+
+def db_ping():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+
+
+# ===================== BOT INIT =====================
+
+bot = telebot.TeleBot(
+    BOT_TOKEN,
+    parse_mode="HTML",
+    disable_web_page_preview=True
+)
+
+# ===================== GLOBAL ERROR GUARD =====================
+
+def safe_call(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            logger.error("Unhandled error:")
+            logger.error(traceback.format_exc())
+    return wrapper
+
+
+bot._notify_command_handlers = safe_call(bot._notify_command_handlers)
+bot._notify_message_handlers = safe_call(bot._notify_message_handlers)
+bot._notify_callback_query_handlers = safe_call(bot._notify_callback_query_handlers)
+
+# ============================================================
+# Block 2/8 — Database schema (PostgreSQL)
+# ============================================================
+
 def init_db():
+    """
+    Create all tables and indexes if they do not exist.
+    Fully PostgreSQL compatible.
+    """
     with get_conn() as conn:
         cur = conn.cursor()
 
+        # -------- USERS --------
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS topics (
-            id SERIAL PRIMARY KEY,
-            text TEXT NOT NULL,
-            user_id BIGINT NOT NULL,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS replies (
-            id SERIAL PRIMARY KEY,
-            topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
-            text TEXT NOT NULL,
-            user_id BIGINT NOT NULL,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS reports (
-            id SERIAL PRIMARY KEY,
-            topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
-            reporter_id BIGINT NOT NULL,
-            reason TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            admin_action TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            resolved_at TIMESTAMP,
-            admin_id BIGINT
-        );
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS bans (
+        CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
-            reason TEXT NOT NULL,
-            admin_id BIGINT NOT NULL,
-            banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            unbanned_at TIMESTAMP,
-            is_active BOOLEAN DEFAULT TRUE
+            created_at TIMESTAMP DEFAULT NOW(),
+            last_active TIMESTAMP DEFAULT NOW(),
+            is_admin BOOLEAN DEFAULT FALSE
         );
         """)
 
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS user_stats (
-            user_id BIGINT PRIMARY KEY,
-            topics_created INTEGER DEFAULT 0,
-            replies_written INTEGER DEFAULT 0,
-            replies_received INTEGER DEFAULT 0,
-            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """)
-
+        # -------- USER NAMES --------
         cur.execute("""
         CREATE TABLE IF NOT EXISTS user_names (
-            user_id BIGINT PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
             username TEXT UNIQUE NOT NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT NOW()
         );
         """)
 
+        # -------- USER SETTINGS --------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+            notify_replies BOOLEAN DEFAULT TRUE,
+            notify_system BOOLEAN DEFAULT TRUE,
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+        """)
+
+        # -------- USER STATS --------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_stats (
+            user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+            topics_created INTEGER DEFAULT 0,
+            replies_written INTEGER DEFAULT 0,
+            replies_received INTEGER DEFAULT 0
+        );
+        """)
+
+        # -------- DAILY LIMITS --------
         cur.execute("""
         CREATE TABLE IF NOT EXISTS daily_limits (
-            user_id BIGINT,
-            date DATE,
+            user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+            date DATE NOT NULL,
             topics_created INTEGER DEFAULT 0,
             PRIMARY KEY (user_id, date)
         );
         """)
 
+        # -------- TOPICS --------
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS user_notifications (
-            user_id BIGINT PRIMARY KEY,
-            reply_notifications BOOLEAN DEFAULT TRUE,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        CREATE TABLE IF NOT EXISTS topics (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+            text TEXT NOT NULL,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW()
         );
         """)
 
-        logger.info("✅ PostgreSQL initialized")
+        # -------- REPLIES --------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS replies (
+            id SERIAL PRIMARY KEY,
+            topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+            user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+            text TEXT NOT NULL,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        """)
 
+        # -------- REPORTS --------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
+            id SERIAL PRIMARY KEY,
+            topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+            reporter_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+            reason TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            admin_id BIGINT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            resolved_at TIMESTAMP
+        );
+        """)
+
+        # -------- BANS --------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS bans (
+            user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+            reason TEXT NOT NULL,
+            banned_at TIMESTAMP DEFAULT NOW(),
+            unban_at TIMESTAMP,
+            is_active BOOLEAN DEFAULT TRUE
+        );
+        """)
+
+        # -------- INDEXES --------
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_topics_active ON topics(is_active);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_replies_topic ON replies(topic_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status);")
+
+        logger.info("Database schema initialized")
+
+
+# Initialize DB on startup
 init_db()
+# ============================================================
+# Block 3/8 — Users, Names, Settings, Stats, Ranks, Bans
+# ============================================================
 
-# ==================== BOT ====================
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+import random
+import re
+import html
 
-# ==================== UTILS ====================
+# ===================== HELPERS =====================
 
 def sanitize(text: str) -> str:
     return html.escape(" ".join(text.strip().split()))
 
-def format_dt(dt):
-    if not dt:
-        return "неизвестно"
-    return dt.strftime("%d.%m.%Y %H:%M")
 
-def generate_username():
+# ===================== USERS =====================
+
+def ensure_user(user_id: int):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (user_id, is_admin)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id) DO NOTHING
+        """, (user_id, user_id == ADMIN_ID))
+
+        cur.execute("""
+            INSERT INTO user_stats (user_id)
+            VALUES (%s)
+            ON CONFLICT (user_id) DO NOTHING
+        """)
+
+        cur.execute("""
+            INSERT INTO user_settings (user_id)
+            VALUES (%s)
+            ON CONFLICT (user_id) DO NOTHING
+        """)
+
+
+# ===================== USERNAMES =====================
+
+def generate_username() -> str:
     while True:
-        name = f"аноним_{random.randint(1000,9999)}"
+        name = f"аноним_{random.randint(1000, 9999)}"
         with get_conn() as conn:
             cur = conn.cursor()
             cur.execute("SELECT 1 FROM user_names WHERE username=%s", (name,))
             if not cur.fetchone():
                 return name
-# ============================================================
-# Part 2/6 — Users, Names, Notifications, Bans, Stats, Ranks
-# ============================================================
 
-# ==================== USERS & NAMES ====================
 
 def get_username(user_id: int) -> str:
+    ensure_user(user_id)
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT username FROM user_names WHERE user_id=%s", (user_id,))
@@ -177,37 +277,33 @@ def get_username(user_id: int) -> str:
         if row:
             return row["username"]
 
-        username = generate_username()
-        cur.execute(
-            "INSERT INTO user_names (user_id, username) VALUES (%s,%s)",
-            (user_id, username)
-        )
-        return username
+        name = generate_username()
+        cur.execute("""
+            INSERT INTO user_names (user_id, username)
+            VALUES (%s, %s)
+        """, (user_id, name))
+        return name
 
 
 def validate_username(username: str):
-    if not username:
-        return False, "Имя не может быть пустым"
-    if len(username) < 3:
-        return False, "Минимум 3 символа"
-    if len(username) > 12:
-        return False, "Максимум 12 символов"
+    if not (3 <= len(username) <= 15):
+        return False, "Имя должно быть от 3 до 15 символов"
     if not re.match(r'^[a-zA-Zа-яА-ЯёЁ0-9_]+$', username):
         return False, "Допустимы только буквы, цифры и _"
-    return True, "OK"
+    return True, None
 
 
 def set_username(user_id: int, username: str):
-    ok, msg = validate_username(username)
+    ok, err = validate_username(username)
     if not ok:
-        return False, msg
+        return False, err
 
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT 1 FROM user_names WHERE username=%s AND user_id!=%s",
-            (username, user_id)
-        )
+        cur.execute("""
+            SELECT 1 FROM user_names
+            WHERE username=%s AND user_id!=%s
+        """, (username, user_id))
         if cur.fetchone():
             return False, "Имя уже занято"
 
@@ -217,98 +313,133 @@ def set_username(user_id: int, username: str):
             ON CONFLICT (user_id)
             DO UPDATE SET username=EXCLUDED.username, updated_at=NOW()
         """, (user_id, username))
-
     return True, "Имя обновлено"
 
 
-# ==================== NOTIFICATIONS ====================
+# ===================== SETTINGS =====================
 
-def get_notifications(user_id: int) -> bool:
+def toggle_notify_replies(user_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE user_settings
+            SET notify_replies = NOT notify_replies,
+                updated_at = NOW()
+            WHERE user_id=%s
+            RETURNING notify_replies
+        """, (user_id,))
+        return cur.fetchone()["notify_replies"]
+
+
+def notify_replies_enabled(user_id: int) -> bool:
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT reply_notifications FROM user_notifications WHERE user_id=%s",
+            "SELECT notify_replies FROM user_settings WHERE user_id=%s",
             (user_id,)
         )
         row = cur.fetchone()
-        if row is not None:
-            return row["reply_notifications"]
-
-        cur.execute(
-            "INSERT INTO user_notifications (user_id, reply_notifications) VALUES (%s,TRUE)",
-            (user_id,)
-        )
-        return True
+        return row["notify_replies"] if row else True
 
 
-def toggle_notifications(user_id: int):
-    current = get_notifications(user_id)
-    new = not current
+# ===================== STATS =====================
+
+def inc_stat(user_id: int, field: str):
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO user_notifications (user_id, reply_notifications, updated_at)
-            VALUES (%s,%s,NOW())
-            ON CONFLICT (user_id)
-            DO UPDATE SET reply_notifications=EXCLUDED.reply_notifications, updated_at=NOW()
-        """, (user_id, new))
-    return new
-
-
-# ==================== BANS ====================
-
-def check_ban(user_id: int):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT * FROM bans
-            WHERE user_id=%s AND is_active=TRUE AND unbanned_at > NOW()
+        cur.execute(f"""
+            UPDATE user_stats
+            SET {field} = {field} + 1
+            WHERE user_id=%s
         """, (user_id,))
+
+
+def get_stats(user_id: int):
+    ensure_user(user_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM user_stats WHERE user_id=%s", (user_id,))
         return cur.fetchone()
 
 
+# ===================== RANKS =====================
+
+RANKS = [
+    ("👶 Новичок", 0),
+    ("🧒 Посетитель", 5),
+    ("👨 Участник", 15),
+    ("👨‍💼 Активист", 30),
+    ("👨‍🎓 Мыслитель", 60),
+    ("👑 Легенда", 120),
+]
+
+
+def get_rank(stats) -> str:
+    total = stats["topics_created"] + stats["replies_written"]
+    current = RANKS[0][0]
+    for name, limit in RANKS:
+        if total >= limit:
+            current = name
+    return current
+
+
+# ===================== BANS =====================
+
 def is_banned(user_id: int) -> bool:
-    return check_ban(user_id) is not None
-
-
-def ban_user(user_id: int, reason: str, admin_id: int, days: int):
-    until = datetime.utcnow() + timedelta(days=days)
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO bans (user_id, reason, admin_id, unbanned_at)
-            VALUES (%s,%s,%s,%s)
+            SELECT 1 FROM bans
+            WHERE user_id=%s
+              AND is_active=TRUE
+              AND (unban_at IS NULL OR unban_at > NOW())
+        """, (user_id,))
+        return cur.fetchone() is not None
+
+
+def ban_user(user_id: int, reason: str, days: int = None):
+    until = datetime.utcnow() + timedelta(days=days) if days else None
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO bans (user_id, reason, unban_at, is_active)
+            VALUES (%s,%s,%s,TRUE)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 reason=EXCLUDED.reason,
-                admin_id=EXCLUDED.admin_id,
+                unban_at=EXCLUDED.unban_at,
                 banned_at=NOW(),
-                unbanned_at=EXCLUDED.unbanned_at,
                 is_active=TRUE
-        """, (user_id, reason, admin_id, until))
-    return until
+        """, (user_id, reason, until))
 
 
 def unban_user(user_id: int):
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE bans SET is_active=FALSE WHERE user_id=%s", (user_id,))
+        cur.execute(
+            "UPDATE bans SET is_active=FALSE WHERE user_id=%s",
+            (user_id,)
+        )
+# ============================================================
+# Block 4/8 — Daily limits, Topics, Replies, Notifications
+# ============================================================
 
+# ===================== DAILY LIMITS =====================
 
-# ==================== DAILY LIMITS ====================
-
-def daily_limit(user_id: int):
+def get_daily_limit(user_id: int):
     today = datetime.utcnow().date()
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT topics_created FROM daily_limits
+            SELECT topics_created
+            FROM daily_limits
             WHERE user_id=%s AND date=%s
         """, (user_id, today))
         row = cur.fetchone()
         if not row:
             return DAILY_TOPIC_LIMIT, 0
-        return max(0, DAILY_TOPIC_LIMIT - row["topics_created"]), row["topics_created"]
+        used = row["topics_created"]
+        return max(0, DAILY_TOPIC_LIMIT - used), used
 
 
 def inc_daily_limit(user_id: int):
@@ -319,73 +450,19 @@ def inc_daily_limit(user_id: int):
             INSERT INTO daily_limits (user_id, date, topics_created)
             VALUES (%s,%s,1)
             ON CONFLICT (user_id, date)
-            DO UPDATE SET topics_created=daily_limits.topics_created+1
+            DO UPDATE SET topics_created = daily_limits.topics_created + 1
         """, (user_id, today))
 
 
-# ==================== STATS ====================
-
-def ensure_stats(user_id: int):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO user_stats (user_id)
-            VALUES (%s)
-            ON CONFLICT DO NOTHING
-        """, (user_id,))
-
-
-def get_stats(user_id: int):
-    ensure_stats(user_id)
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM user_stats WHERE user_id=%s", (user_id,))
-        return cur.fetchone()
-
-
-def inc_stat(user_id: int, field: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(f"""
-            UPDATE user_stats
-            SET {field} = {field} + 1,
-                last_active = NOW()
-            WHERE user_id=%s
-        """, (user_id,))
-
-
-# ==================== RANKS ====================
-
-RANKS = [
-    ("👶 НОВИЧОК", 4, 9),
-    ("🧒 ПОСЕТИТЕЛЬ", 9, 24),
-    ("👨 УЧАСТНИК", 19, 49),
-    ("👨‍💼 АКТИВИСТ", 34, 99),
-    ("👨‍🔬 АВТОР", 54, 199),
-    ("👨‍🎓 МЫСЛИТЕЛЬ", 84, 399),
-    ("👨‍🚀 ДИСКУТАНТ", 129, 699),
-    ("👨‍✈️ ФИЛОСОФ", 199, 1199),
-    ("👑 МАСТЕР", 299, 1999),
-    ("⚡ ЛЕГЕНДА", 999999, 999999),
-]
-
-
-def get_rank(stats):
-    for name, max_topics, max_replies in RANKS:
-        if stats["topics_created"] <= max_topics and stats["replies_written"] <= max_replies:
-            return name
-    return RANKS[-1][0]
-# ============================================================
-# Part 3/6 — Topics, Replies, Feeds, Pagination, Notifications
-# ============================================================
-
-# ==================== TOPICS ====================
+# ===================== TOPICS =====================
 
 def create_topic(user_id: int, text: str):
+    ensure_user(user_id)
+
     if is_banned(user_id):
         return "banned"
 
-    remaining, _ = daily_limit(user_id)
+    remaining, _ = get_daily_limit(user_id)
     if remaining <= 0:
         return "limit"
 
@@ -396,14 +473,13 @@ def create_topic(user_id: int, text: str):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO topics (text, user_id)
+            INSERT INTO topics (user_id, text)
             VALUES (%s,%s)
             RETURNING id
-        """, (text, user_id))
+        """, (user_id, text))
         topic_id = cur.fetchone()["id"]
 
     inc_daily_limit(user_id)
-    ensure_stats(user_id)
     inc_stat(user_id, "topics_created")
     return topic_id
 
@@ -414,24 +490,26 @@ def get_topic(topic_id: int):
         cur.execute("""
             SELECT t.*, u.username
             FROM topics t
-            JOIN user_names u ON u.user_id = t.user_id
+            JOIN user_names u ON u.user_id=t.user_id
             WHERE t.id=%s AND t.is_active=TRUE
         """, (topic_id,))
         return cur.fetchone()
 
 
-def delete_topic(topic_id: int, admin=False):
+def delete_topic(topic_id: int):
     with get_conn() as conn:
         cur = conn.cursor()
-        if admin:
-            cur.execute("DELETE FROM topics WHERE id=%s", (topic_id,))
-        else:
-            cur.execute("UPDATE topics SET is_active=FALSE WHERE id=%s", (topic_id,))
+        cur.execute(
+            "UPDATE topics SET is_active=FALSE WHERE id=%s",
+            (topic_id,)
+        )
 
 
-# ==================== REPLIES ====================
+# ===================== REPLIES =====================
 
 def add_reply(topic_id: int, user_id: int, text: str):
+    ensure_user(user_id)
+
     if is_banned(user_id):
         return "banned"
 
@@ -449,32 +527,30 @@ def add_reply(topic_id: int, user_id: int, text: str):
         if not row:
             return "not_found"
 
-        author_id = row["user_id"]
+        topic_author = row["user_id"]
 
         cur.execute("""
-            INSERT INTO replies (topic_id, text, user_id)
+            INSERT INTO replies (topic_id, user_id, text)
             VALUES (%s,%s,%s)
-        """, (topic_id, text, user_id))
+        """, (topic_id, user_id, text))
 
-    ensure_stats(user_id)
     inc_stat(user_id, "replies_written")
-    ensure_stats(author_id)
-    inc_stat(author_id, "replies_received")
+    inc_stat(topic_author, "replies_received")
 
-    # уведомление автору
-    if author_id != user_id and get_notifications(author_id):
+    # notify author
+    if topic_author != user_id and notify_replies_enabled(topic_author):
         try:
             bot.send_message(
-                author_id,
-                f"💬 На вашу тему ответили:\n\n<i>{text[:200]}</i>"
+                topic_author,
+                "💬 На вашу тему пришёл новый ответ"
             )
-        except:
+        except Exception:
             pass
 
     return True
 
 
-def get_replies(topic_id: int, offset=0, limit=5):
+def get_replies(topic_id: int, offset: int = 0, limit: int = REPLIES_PAGE_SIZE):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -486,11 +562,38 @@ def get_replies(topic_id: int, offset=0, limit=5):
             OFFSET %s LIMIT %s
         """, (topic_id, offset, limit))
         return cur.fetchall()
+# ============================================================
+# Block 5/8 — Feeds, Popular, Random, Pagination, Formatting
+# ============================================================
+
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# ===================== FORMATTING =====================
+
+def fmt_dt(dt):
+    return dt.strftime("%d.%m.%Y %H:%M") if dt else "-"
 
 
-# ==================== FEEDS ====================
+def format_topic(topic):
+    return (
+        f"📝 <b>Тема #{topic['id']}</b>\n"
+        f"👤 {topic['username']}\n"
+        f"🕒 {fmt_dt(topic['created_at'])}\n\n"
+        f"{topic['text']}"
+    )
 
-def get_latest_topics(offset=0, limit=5):
+
+def format_reply(reply):
+    return (
+        f"💬 <b>{reply['username']}</b> "
+        f"<i>{fmt_dt(reply['created_at'])}</i>\n"
+        f"{reply['text']}"
+    )
+
+
+# ===================== FEEDS =====================
+
+def get_feed(offset: int = 0, limit: int = TOPICS_PAGE_SIZE):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -504,26 +607,14 @@ def get_latest_topics(offset=0, limit=5):
         return cur.fetchall()
 
 
-def get_random_topic():
+def get_popular(limit: int = 5):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT t.id FROM topics t
-            WHERE t.is_active=TRUE
-            ORDER BY RANDOM()
-            LIMIT 1
-        """)
-        row = cur.fetchone()
-        return row["id"] if row else None
-
-
-def get_popular_topics(limit=5):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT t.id, t.text, COUNT(r.id) AS replies, u.username
+            SELECT t.id, t.text, u.username, COUNT(r.id) AS replies
             FROM topics t
-            LEFT JOIN replies r ON r.topic_id=t.id AND r.is_active=TRUE
+            LEFT JOIN replies r
+              ON r.topic_id=t.id AND r.is_active=TRUE
             JOIN user_names u ON u.user_id=t.user_id
             WHERE t.is_active=TRUE
             GROUP BY t.id, u.username
@@ -533,92 +624,98 @@ def get_popular_topics(limit=5):
         return cur.fetchall()
 
 
-# ==================== PAGINATION ====================
+def get_random_topic():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id FROM topics
+            WHERE is_active=TRUE
+            ORDER BY RANDOM()
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        return row["id"] if row else None
 
-def format_topic(topic):
-    return (
-        f"📝 <b>Тема #{topic['id']}</b>\n"
-        f"👤 {topic['username']}\n"
-        f"🕒 {format_dt(topic['created_at'])}\n\n"
-        f"{topic['text']}"
-    )
 
+# ===================== KEYBOARDS =====================
 
-def format_reply(reply):
-    return (
-        f"💬 <b>{reply['username']}</b> "
-        f"<i>{format_dt(reply['created_at'])}</i>\n"
-        f"{reply['text']}"
-    )
-# ============================================================
-# Part 4/6 — Telegram UI, Commands, Inline Buttons, States
-# ============================================================
-
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-
-# ==================== USER STATES ====================
-
-USER_STATES = {}  # user_id -> dict
-
-def set_state(user_id, state, data=None):
-    USER_STATES[user_id] = {"state": state, "data": data or {}}
-
-def clear_state(user_id):
-    USER_STATES.pop(user_id, None)
-
-def get_state(user_id):
-    return USER_STATES.get(user_id)
-
-# ==================== KEYBOARDS ====================
-
-def main_menu():
+def kb_topic(topic_id: int):
     kb = InlineKeyboardMarkup()
     kb.add(
-        InlineKeyboardButton("📰 Лента", callback_data="feed_0"),
+        InlineKeyboardButton("💬 Ответить", callback_data=f"reply:{topic_id}"),
+        InlineKeyboardButton("📖 Ответы", callback_data=f"replies:{topic_id}:0")
+    )
+    kb.add(
+        InlineKeyboardButton("🚩 Пожаловаться", callback_data=f"report:{topic_id}")
+    )
+    return kb
+
+
+def kb_feed(offset: int):
+    kb = InlineKeyboardMarkup()
+    if offset > 0:
+        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data=f"feed:{offset-TOPICS_PAGE_SIZE}"))
+    kb.add(InlineKeyboardButton("➡️ Далее", callback_data=f"feed:{offset+TOPICS_PAGE_SIZE}"))
+    return kb
+# ============================================================
+# Block 6/8 — Commands, States, Text Handling
+# ============================================================
+
+# ===================== USER STATES =====================
+
+USER_STATE = {}  # user_id -> dict
+
+
+def set_state(user_id: int, state: str, data: dict | None = None):
+    USER_STATE[user_id] = {"state": state, "data": data or {}}
+
+
+def clear_state(user_id: int):
+    USER_STATE.pop(user_id, None)
+
+
+def get_state(user_id: int):
+    return USER_STATE.get(user_id)
+
+
+# ===================== MAIN MENU =====================
+
+def kb_main():
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("📰 Лента", callback_data="feed:0"),
         InlineKeyboardButton("🎲 Случайная", callback_data="random")
     )
     kb.add(
-        InlineKeyboardButton("🔥 Популярные", callback_data="top"),
+        InlineKeyboardButton("🔥 Популярные", callback_data="popular"),
         InlineKeyboardButton("👤 Профиль", callback_data="profile")
     )
     return kb
 
 
-def topic_keyboard(topic_id):
-    kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("💬 Ответить", callback_data=f"reply_{topic_id}"),
-        InlineKeyboardButton("🚩 Пожаловаться", callback_data=f"report_{topic_id}")
-    )
-    return kb
-
-
-def replies_keyboard(topic_id, offset):
-    kb = InlineKeyboardMarkup()
-    if offset > 0:
-        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data=f"replies_{topic_id}_{offset-5}"))
-    kb.add(InlineKeyboardButton("➡️ Далее", callback_data=f"replies_{topic_id}_{offset+5}"))
-    return kb
-
-# ==================== COMMANDS ====================
+# ===================== COMMANDS =====================
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
-    username = get_username(message.from_user.id)
+    user_id = message.from_user.id
+    ensure_user(user_id)
+    username = get_username(user_id)
+
     bot.send_message(
         message.chat.id,
         f"👋 Привет, <b>{username}</b>!\n\n"
         "Напиши мысль — она станет темой.\n"
-        "Или используй меню ниже 👇",
-        reply_markup=main_menu()
+        "Или выбери действие 👇",
+        reply_markup=kb_main()
     )
 
 
 @bot.message_handler(commands=["profile"])
 def cmd_profile(message):
-    stats = get_stats(message.from_user.id)
+    user_id = message.from_user.id
+    stats = get_stats(user_id)
     rank = get_rank(stats)
-    username = get_username(message.from_user.id)
+    username = get_username(user_id)
 
     bot.send_message(
         message.chat.id,
@@ -635,36 +732,43 @@ def cmd_profile(message):
     )
 
 
-# ==================== TEXT HANDLER ====================
+# ===================== TEXT HANDLER =====================
 
 @bot.message_handler(func=lambda m: True)
-def text_handler(message):
-    state = get_state(message.from_user.id)
+def on_text(message):
+    user_id = message.from_user.id
+    ensure_user(user_id)
 
-    if state:
-        if state["state"] == "reply":
-            topic_id = state["data"]["topic_id"]
-            res = add_reply(topic_id, message.from_user.id, message.text)
-            clear_state(message.from_user.id)
+    state = get_state(user_id)
 
-            if res == "banned":
-                bot.send_message(message.chat.id, "🚫 Вы заблокированы")
-            elif res == "short":
-                bot.send_message(message.chat.id, "⚠️ Слишком короткий ответ")
-            elif res == "not_found":
-                bot.send_message(message.chat.id, "❌ Тема не найдена")
-            else:
-                bot.send_message(message.chat.id, "✅ Ответ добавлен")
-            return
+    # ---- reply to topic ----
+    if state and state["state"] == "reply":
+        topic_id = state["data"]["topic_id"]
+        clear_state(user_id)
+        res = add_reply(topic_id, user_id, message.text)
 
-        if state["state"] == "change_name":
-            ok, msg = set_username(message.from_user.id, message.text)
-            clear_state(message.from_user.id)
-            bot.send_message(message.chat.id, "✅ "+msg if ok else "❌ "+msg)
-            return
+        if res == "banned":
+            bot.send_message(message.chat.id, "🚫 Вы заблокированы")
+        elif res == "short":
+            bot.send_message(message.chat.id, "⚠️ Ответ слишком короткий")
+        elif res == "not_found":
+            bot.send_message(message.chat.id, "❌ Тема не найдена")
+        else:
+            bot.send_message(message.chat.id, "✅ Ответ добавлен")
+        return
 
-    # если нет состояния — создаём тему
-    res = create_topic(message.from_user.id, message.text)
+    # ---- change username ----
+    if state and state["state"] == "change_name":
+        clear_state(user_id)
+        ok, msg = set_username(user_id, message.text)
+        bot.send_message(
+            message.chat.id,
+            ("✅ " if ok else "❌ ") + msg
+        )
+        return
+
+    # ---- create topic ----
+    res = create_topic(user_id, message.text)
 
     if res == "banned":
         bot.send_message(message.chat.id, "🚫 Вы заблокированы")
@@ -677,301 +781,237 @@ def text_handler(message):
         bot.send_message(
             message.chat.id,
             "✅ Тема создана:\n\n" + format_topic(topic),
-            reply_markup=topic_keyboard(res)
+            reply_markup=kb_topic(res)
         )
-
-# ==================== CALLBACKS ====================
+# ============================================================
+# Block 7/8 — Callback queries, Feeds, Replies, Reports
+# ============================================================
 
 @bot.callback_query_handler(func=lambda c: True)
-def callbacks(call):
-    data = call.data
+def on_callback(call):
     user_id = call.from_user.id
+    ensure_user(user_id)
 
-    if data.startswith("feed_"):
-        offset = int(data.split("_")[1])
-        topics = get_latest_topics(offset)
+    data = call.data.split(":")
+    action = data[0]
+
+    # ===================== FEED =====================
+    if action == "feed":
+        offset = int(data[1])
+        topics = get_feed(offset)
+
         if not topics:
-            bot.answer_callback_query(call.id, "Пусто")
+            bot.answer_callback_query(call.id, "Больше тем нет")
             return
 
         for t in topics:
             bot.send_message(
                 call.message.chat.id,
                 format_topic(t),
-                reply_markup=topic_keyboard(t["id"])
+                reply_markup=kb_topic(t["id"])
             )
-        return
 
-    if data == "random":
-        tid = get_random_topic()
-        if not tid:
-            bot.answer_callback_query(call.id, "Нет тем")
+        bot.send_message(
+            call.message.chat.id,
+            "⬇️ Навигация",
+            reply_markup=kb_feed(offset)
+        )
+
+    # ===================== RANDOM =====================
+    elif action == "random":
+        topic_id = get_random_topic()
+        if not topic_id:
+            bot.answer_callback_query(call.id, "Тем пока нет")
             return
-        topic = get_topic(tid)
+
+        topic = get_topic(topic_id)
         bot.send_message(
             call.message.chat.id,
             format_topic(topic),
-            reply_markup=topic_keyboard(tid)
+            reply_markup=kb_topic(topic_id)
         )
-        return
 
-    if data == "top":
-        topics = get_popular_topics()
+    # ===================== POPULAR =====================
+    elif action == "popular":
+        topics = get_popular()
         if not topics:
-            bot.answer_callback_query(call.id, "Нет данных")
+            bot.answer_callback_query(call.id, "Пока пусто")
             return
+
         for t in topics:
             bot.send_message(
                 call.message.chat.id,
-                f"🔥 <b>{t['username']}</b>\n💬 {t['replies']} ответов\n\n{t['text']}",
-                reply_markup=topic_keyboard(t["id"])
+                f"🔥 <b>{t['username']}</b>\n"
+                f"💬 Ответов: {t['replies']}\n\n"
+                f"{t['text']}",
+                reply_markup=kb_topic(t["id"])
             )
-        return
 
-    if data.startswith("reply_"):
-        topic_id = int(data.split("_")[1])
-        set_state(user_id, "reply", {"topic_id": topic_id})
-        bot.send_message(call.message.chat.id, "✍️ Напишите ответ")
-        return
+    # ===================== REPLIES =====================
+    elif action == "replies":
+        topic_id = int(data[1])
+        offset = int(data[2])
+        replies = get_replies(topic_id, offset)
 
-    if data.startswith("replies_"):
-        _, topic_id, offset = data.split("_")
-        replies = get_replies(int(topic_id), int(offset))
         if not replies:
             bot.answer_callback_query(call.id, "Ответов нет")
             return
+
         for r in replies:
             bot.send_message(
                 call.message.chat.id,
                 format_reply(r)
             )
+
+    # ===================== REPLY =====================
+    elif action == "reply":
+        topic_id = int(data[1])
+        set_state(user_id, "reply", {"topic_id": topic_id})
         bot.send_message(
             call.message.chat.id,
-            "Навигация:",
-            reply_markup=replies_keyboard(int(topic_id), int(offset))
+            "✍️ Напишите ответ:"
         )
-        return
 
-    if data == "profile":
+    # ===================== PROFILE =====================
+    elif action == "profile":
         cmd_profile(call.message)
-        return
 
-    if data == "change_name":
+    elif action == "change_name":
         set_state(user_id, "change_name")
-        bot.send_message(call.message.chat.id, "✏️ Введите новое имя")
-        return
-
-    if data == "toggle_notify":
-        new = toggle_notifications(user_id)
         bot.send_message(
             call.message.chat.id,
-            "🔔 Уведомления включены" if new else "🔕 Уведомления выключены"
+            "✏️ Введите новое имя:"
         )
+
+    elif action == "toggle_notify":
+        state = toggle_notify_replies(user_id)
+        bot.send_message(
+            call.message.chat.id,
+            "🔔 Уведомления: " + ("включены" if state else "выключены")
+        )
+
+    # ===================== REPORT =====================
+    elif action == "report":
+        topic_id = int(data[1])
+        set_state(user_id, "report", {"topic_id": topic_id})
+        bot.send_message(
+            call.message.chat.id,
+            "🚩 Укажите причину жалобы:"
+        )
+
+    bot.answer_callback_query(call.id)
+# ============================================================
+# Block 8/8 — Admin, Reports, Safe Polling, Railway
+# ============================================================
+
+# ===================== REPORT HANDLER =====================
+
+@bot.message_handler(func=lambda m: get_state(m.from_user.id) and get_state(m.from_user.id)["state"] == "report")
+def handle_report(message):
+    user_id = message.from_user.id
+    state = get_state(user_id)
+    topic_id = state["data"]["topic_id"]
+    clear_state(user_id)
+
+    reason = sanitize(message.text)
+    if len(reason) < 3:
+        bot.send_message(message.chat.id, "⚠️ Причина слишком короткая")
         return
-# ============================================================
-# Part 5/6 — Reports, Admin Panel, Moderation, Bans
-# ============================================================
 
-# ==================== REPORTS ====================
-
-def create_report(topic_id: int, reporter_id: int, reason: str):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO reports (topic_id, reporter_id, reason)
             VALUES (%s,%s,%s)
-        """, (topic_id, reporter_id, sanitize(reason)))
+        """, (topic_id, user_id, reason))
+
+    bot.send_message(message.chat.id, "🚩 Жалоба отправлена")
+
+    # notify admin
+    if ADMIN_ID:
+        try:
+            bot.send_message(
+                ADMIN_ID,
+                f"🚨 <b>Новая жалоба</b>\n"
+                f"Тема #{topic_id}\n"
+                f"От: {get_username(user_id)}\n"
+                f"Причина: {reason}"
+            )
+        except Exception:
+            pass
 
 
-def get_pending_reports():
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT r.*, t.text, u.username
-            FROM reports r
-            JOIN topics t ON t.id = r.topic_id
-            JOIN user_names u ON u.user_id = t.user_id
-            WHERE r.status='pending'
-            ORDER BY r.created_at ASC
-        """)
-        return cur.fetchall()
-
-
-def resolve_report(report_id: int, action: str, admin_id: int):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE reports
-            SET status='resolved',
-                admin_action=%s,
-                admin_id=%s,
-                resolved_at=NOW()
-            WHERE id=%s
-        """, (action, admin_id, report_id))
-
-
-# ==================== ADMIN CHECK ====================
+# ===================== ADMIN COMMANDS =====================
 
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
 
-# ==================== ADMIN COMMANDS ====================
-
-@bot.message_handler(commands=["admin"])
-def admin_panel(message):
+@bot.message_handler(commands=["ban"])
+def cmd_ban(message):
     if not is_admin(message.from_user.id):
         return
 
-    kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("🚩 Жалобы", callback_data="admin_reports"),
-        InlineKeyboardButton("⛔ Активные баны", callback_data="admin_bans")
-    )
+    try:
+        _, uid, days, *reason = message.text.split()
+        ban_user(int(uid), " ".join(reason) or "ban", int(days))
+        bot.send_message(message.chat.id, "⛔ Пользователь забанен")
+    except Exception:
+        bot.send_message(message.chat.id, "❌ Использование: /ban user_id days reason")
+
+
+@bot.message_handler(commands=["unban"])
+def cmd_unban(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    try:
+        _, uid = message.text.split()
+        unban_user(int(uid))
+        bot.send_message(message.chat.id, "✅ Пользователь разбанен")
+    except Exception:
+        bot.send_message(message.chat.id, "❌ Использование: /unban user_id")
+
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS c FROM users")
+        users = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM topics")
+        topics = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM replies")
+        replies = cur.fetchone()["c"]
+
     bot.send_message(
         message.chat.id,
-        "🛠 <b>Админ-панель</b>",
-        reply_markup=kb
+        f"📊 <b>Статистика</b>\n\n"
+        f"👤 Пользователей: {users}\n"
+        f"📝 Тем: {topics}\n"
+        f"💬 Ответов: {replies}"
     )
 
 
-# ==================== ADMIN CALLBACKS ====================
+# ===================== SAFE POLLING =====================
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_"))
-def admin_callbacks(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа")
-        return
-
-    if call.data == "admin_reports":
-        reports = get_pending_reports()
-        if not reports:
-            bot.send_message(call.message.chat.id, "Жалоб нет")
-            return
-
-        for r in reports:
-            kb = InlineKeyboardMarkup()
-            kb.add(
-                InlineKeyboardButton("❌ Удалить тему", callback_data=f"admin_del_{r['topic_id']}_{r['id']}"),
-                InlineKeyboardButton("⛔ Бан 7д", callback_data=f"admin_ban_{r['topic_id']}_{r['id']}_7"),
-                InlineKeyboardButton("⛔ Бан 30д", callback_data=f"admin_ban_{r['topic_id']}_{r['id']}_30")
-            )
-            bot.send_message(
-                call.message.chat.id,
-                f"🚩 <b>Жалоба #{r['id']}</b>\n"
-                f"Автор: {r['username']}\n"
-                f"Причина: {r['reason']}\n\n"
-                f"{r['text']}",
-                reply_markup=kb
-            )
-        return
-
-    if call.data == "admin_bans":
-        with get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT b.*, u.username
-                FROM bans b
-                JOIN user_names u ON u.user_id=b.user_id
-                WHERE b.is_active=TRUE
-            """)
-            bans = cur.fetchall()
-
-        if not bans:
-            bot.send_message(call.message.chat.id, "Активных банов нет")
-            return
-
-        for b in bans:
-            bot.send_message(
-                call.message.chat.id,
-                f"⛔ <b>{b['username']}</b>\n"
-                f"Причина: {b['reason']}\n"
-                f"До: {format_dt(b['unbanned_at'])}"
-            )
-
-
-# ==================== ADMIN ACTIONS ====================
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_del_"))
-def admin_delete(call):
-    if not is_admin(call.from_user.id):
-        return
-
-    _, _, topic_id, report_id = call.data.split("_")
-    delete_topic(int(topic_id), admin=True)
-    resolve_report(int(report_id), "deleted", call.from_user.id)
-    bot.answer_callback_query(call.id, "Тема удалена")
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_ban_"))
-def admin_ban(call):
-    if not is_admin(call.from_user.id):
-        return
-
-    _, _, topic_id, report_id, days = call.data.split("_")
-    topic = get_topic(int(topic_id))
-    if topic:
-        ban_user(topic["user_id"], "Нарушение правил", call.from_user.id, int(days))
-    resolve_report(int(report_id), f"ban_{days}", call.from_user.id)
-    bot.answer_callback_query(call.id, f"Бан на {days} дней")
-# ============================================================
-# Part 6/6 — Safety, Anti-crash, Railway-safe Run
-# ============================================================
-
-import sys
-import traceback
-
-# ==================== GLOBAL ERROR HANDLER ====================
-
-def safe_handler(func):
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            logger.error("❌ ERROR in handler")
-            logger.error(traceback.format_exc())
-    return wrapper
-
-
-# ==================== APPLY SAFE HANDLER ====================
-
-bot._notify_command_handlers = safe_handler(bot._notify_command_handlers)
-bot._notify_message_handlers = safe_handler(bot._notify_message_handlers)
-bot._notify_callback_query_handlers = safe_handler(bot._notify_callback_query_handlers)
-
-
-# ==================== HEALTH CHECK ====================
-
-def self_check():
-    try:
-        with get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-        bot.get_me()
-        logger.info("✅ Self-check OK")
-    except Exception as e:
-        logger.critical("❌ Self-check failed")
-        logger.critical(e)
-        sys.exit(1)
-
-
-# ==================== STARTUP ====================
-
-if __name__ == "__main__":
-    logger.info("🚀 Starting Telegram bot (PostgreSQL / Railway)")
-    self_check()
-
+def run_bot():
+    logger.info("Bot started polling")
     while True:
         try:
             bot.infinity_polling(
-                timeout=60,
-                long_polling_timeout=60,
-                skip_pending=True
+                timeout=30,
+                long_polling_timeout=30
             )
-        except KeyboardInterrupt:
-            logger.info("🛑 Bot stopped manually")
-            break
-        except Exception as e:
-            logger.error("🔥 Bot crashed, restarting in 5s")
-            logger.error(e)
-            time.sleep(5)
+        except Exception:
+            logger.error("Polling crashed, restarting...")
+            logger.error(traceback.format_exc())
+            time.sleep(RECONNECT_DELAY)
+
+
+if __name__ == "__main__":
+    db_ping()
+    run_bot()
