@@ -1,4 +1,4 @@
 pyTelegramBotAPI==4.16.1
 Flask==2.3.3
 telebot==0.0.5
-psycopg2==2.9.9
+psycopg2==3.1.18
